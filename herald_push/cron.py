@@ -32,6 +32,12 @@ STALE_SECONDS = 30 * 60
 SETTLE_SECONDS = 2.0
 MAX_READ = 256 * 1024
 MAX_LABEL = 64
+# The Inbox list carries the start of each run; a run read in full is capped at this.
+LIST_TEXT = 600
+MAX_TEXT = 48 * 1024
+MAX_LIST = 100
+# How far back each job's folder is looked through for the Inbox list.
+PER_JOB = 30
 
 OK = "ok"
 FAILED = "failed"
@@ -254,3 +260,44 @@ class CronWatcher:
                 if run is not None:
                     found.append(run)
         return found, changed
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def as_item(run: Run, limit: int) -> dict:
+    return {"bot": run.profile, "job": run.job_id, "run": run.run, "label": run.name, "status": run.status,
+            "at": int(run.at), "text": _clip(run.text, limit)}
+
+
+def inbox(homes: Iterable[Tuple[str, Path]], follow: Follow, limit: int = 50, before: float = 0) -> List[dict]:
+    """The runs a phone follows (and every failure, when it asked), newest first, each with the start of its
+    text. ``before`` (unix seconds) pages back."""
+    limit = max(1, min(int(limit), MAX_LIST))
+    found: List[Run] = []
+    for profile, job_id, folder in output_dirs(homes):
+        followed = job_id in follow.jobs
+        if not followed and not follow.failures:
+            continue
+        for path in reversed(runs_after(folder, "")[-PER_JOB:]):
+            run = read_run(profile, job_id, path)
+            if run is None or (before and run.at >= before):
+                continue
+            if followed or run.status == FAILED:
+                found.append(run)
+    found.sort(key=lambda r: r.at, reverse=True)
+    return [as_item(r, LIST_TEXT) for r in found[:limit]]
+
+
+def read(homes: Iterable[Tuple[str, Path]], profile: str, job_id: str, run: str) -> Optional[dict]:
+    """One run in full (up to MAX_TEXT), or None when there's no such run or it stayed silent."""
+    if not (PROFILE_RE.match(profile) and JOB_ID_RE.match(job_id) and RUN_RE.match(run)):
+        return None
+    for name, home in homes:
+        if name != profile:
+            continue
+        path = home / "cron" / "output" / job_id / f"{run}.md"
+        found = read_run(profile, job_id, path) if path.is_file() else None
+        return as_item(found, MAX_TEXT) if found else None
+    return None

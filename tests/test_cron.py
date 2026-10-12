@@ -192,3 +192,57 @@ def test_the_watcher_pushes_a_followed_run_that_opens_on_the_phone(tmp_path, mon
     opened = crypto.open_envelope(crypto.Envelope.from_json(body), device.push_topic, crypto.G2P, enc,
                                   crypto.decode_public(store.public_identity()["sig_pub"]))
     assert json.loads(opened)["text"] == payload["text"]
+
+
+# ── the Inbox list and one run in full ───────────────────────────────────────
+
+def test_inbox_lists_followed_runs_and_failures_newest_first(tmp_path):
+    root = tmp_path / "root"
+    write_run(root, "brief", "2026-10-11_08-00-00", agent_run(response="Monday"), age=7200)
+    write_run(root, "brief", "2026-10-12_08-00-00", agent_run(response="Tuesday " + "x" * 2000), age=3600)
+    write_run(root, "brief", "2026-10-13_08-00-00", agent_run(response="[SILENT]"), age=60)
+    write_run(root, "noise", "2026-10-12_09-00-00", agent_run(name="noise", response="hourly"), age=1800)
+    failed = "# Cron Job: noise (FAILED)\n\n**Job ID:** noise\n\n## Error\n\nboom\n"
+    write_run(root, "noise", "2026-10-12_10-00-00", failed, age=900)
+    homes = list(watcher.profile_homes(root))
+
+    runs = cron.inbox(homes, cron.Follow({"brief": "quiet"}))
+    assert [r["text"][:7] for r in runs] == ["Tuesday", "Monday"]
+    assert len(runs[0]["text"]) == cron.LIST_TEXT and runs[0]["text"].endswith("…")
+
+    with_failures = cron.inbox(homes, cron.Follow({"brief": "quiet"}, failures=True))
+    assert [(r["job"], r["status"]) for r in with_failures] == [("noise", "failed"), ("brief", "ok"), ("brief", "ok")]
+    assert with_failures[0]["label"] == "noise"
+
+    older = cron.inbox(homes, cron.Follow({"brief": "quiet"}), before=runs[0]["at"])
+    assert [r["run"] for r in older] == ["2026-10-11_08-00-00"]
+    assert cron.inbox(homes, cron.Follow({})) == []
+
+
+def test_read_gives_one_run_in_full_and_refuses_odd_paths(tmp_path):
+    root = tmp_path / "root"
+    write_run(root, "brief", "2026-10-12_08-00-00", agent_run(response="Tuesday " + "x" * 2000))
+    homes = list(watcher.profile_homes(root))
+    run = cron.read(homes, "default", "brief", "2026-10-12_08-00-00")
+    assert run["text"].startswith("Tuesday") and len(run["text"]) > 2000
+    assert cron.read(homes, "default", "brief", "../../etc/passwd") is None
+    assert cron.read(homes, "default", "..", "2026-10-12_08-00-00") is None
+    assert cron.read(homes, "nobody", "brief", "2026-10-12_08-00-00") is None
+
+
+def test_inbox_and_read_commands(tmp_path):
+    root = tmp_path / "root"
+    store = Store(root / "plugin-data" / "herald-push")
+    data, _ = phone()
+    store.upsert(Device.parse(data))
+    write_run(root, "brief", "2026-10-12_08-00-00", agent_run(response="Tuesday"))
+    handle = commands.make_handler(store, "t", lambda: True, trusted=lambda: True, root=root)
+    me = {"device_id": data["device_id"]}
+    assert json.loads(handle("cron inbox " + json.dumps(me)))["runs"] == []
+    handle("cron follow " + json.dumps({**me, "jobs": {"brief": "notify"}}))
+    runs = json.loads(handle("cron inbox " + json.dumps(me)))["runs"]
+    assert [r["text"] for r in runs] == ["Tuesday"]
+    one = json.loads(handle("cron read " + json.dumps({**me, "bot": "default", "job": "brief", "run": runs[0]["run"]})))
+    assert one["ok"] and one["run"]["text"] == "Tuesday"
+    assert json.loads(handle("cron read " + json.dumps({**me, "bot": "default", "job": "brief", "run": "nope"})))["ok"] is False
+    assert json.loads(handle("cron inbox " + json.dumps({**me, "limit": "x"})))["ok"] is False

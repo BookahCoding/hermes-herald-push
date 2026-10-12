@@ -45,6 +45,9 @@ Finished cron runs for Herald's Inbox, for the jobs a phone follows.
 - **What is sent.** A `cron_run` push: `bot` (profile), `job`, `run` (the output file's name), `label` (the
   job's name), `status` (`ok` or `failed`), `notify`, `at` and the start of the output as `text` (about 1,800
   characters, like a bot message). Herald fetches the whole run over the direct connection.
+- **The Inbox.** `cron inbox` lists the runs a phone follows (and every failure, when it asked), newest first,
+  each with the start of its text; `limit` and `before` page back. `cron read` gives one run in full (`bot`,
+  `job`, `run`, up to 48 KB). Both read the same output files, so they work for every profile.
 - **What isn't.** Runs that stayed silent (`[SILENT]`, a script with no output, a gate that didn't wake the
   agent), a job's history when it is first seen, and runs older than 30 minutes when found (after a restart).
 

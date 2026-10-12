@@ -49,7 +49,7 @@ def register(ctx) -> None:
 
     phones = Phones(store, wake)
     register_tools(ctx, phones)
-    ctx.register_command("herald-push", make_handler(store, VERSION, watching, phones=phones),
+    ctx.register_command("herald-push", make_handler(store, VERSION, watching, phones=phones, root=root),
                          description="Herald push notifications and phone tools: phones registered with this gateway",
                          args_hint="info | register <json> | unregister <id> | test <id> | phone …")
 
