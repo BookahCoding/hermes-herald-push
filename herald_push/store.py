@@ -217,3 +217,14 @@ class Store:
 
     def save_marks(self, marks: Dict[str, int]) -> None:
         _write_private(self.root / "marks.json", marks)
+
+    def cron_marks(self) -> Dict[str, str]:
+        """Per job's output folder (``cron:<profile>:<job>``), the newest run the watcher has seen."""
+        try:
+            raw = json.loads((self.root / "cron-marks.json").read_text(encoding="utf-8"))
+            return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def save_cron_marks(self, marks: Dict[str, str]) -> None:
+        _write_private(self.root / "cron-marks.json", marks)

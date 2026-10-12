@@ -32,6 +32,22 @@ hermes plugins install https://github.com/Giton22/hermes-herald-push
 
 **Not yet:** replying or approving through push. Those still use the direct connection.
 
+## Cron runs (0.4.0)
+
+Finished cron runs for Herald's Inbox, for the jobs a phone follows.
+
+- **Read from the output files.** Hermes writes every finished run to `<home>/cron/output/<job>/<time>.md`,
+  whatever the job delivers to. The watcher reads those, in every profile, so a job keeps going to Telegram or
+  wherever it went before; following it here only adds the phone.
+- **Per job, per phone.** Herald sends `/herald-push cron follow` with `device_id`, `jobs` (job id to `notify`
+  or `quiet`) and `failures` (any failed run notifies, followed or not). `cron following` reads it back. The
+  list is in `cron.json` (0600) and is kept per registered phone.
+- **What is sent.** A `cron_run` push: `bot` (profile), `job`, `run` (the output file's name), `label` (the
+  job's name), `status` (`ok` or `failed`), `notify`, `at` and the start of the output as `text` (about 1,800
+  characters, like a bot message). Herald fetches the whole run over the direct connection.
+- **What isn't.** Runs that stayed silent (`[SILENT]`, a script with no output, a gate that didn't wake the
+  agent), a job's history when it is first seen, and runs older than 30 minutes when found (after a restart).
+
 ## Phone tools (0.3.3)
 
 Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery`, `phone_network`,

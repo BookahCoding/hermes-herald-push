@@ -1,0 +1,256 @@
+"""Cron runs for Herald's Inbox: which jobs each phone follows, and the finished runs to tell it about.
+
+Hermes writes every finished run of a job to ``<home>/cron/output/<job_id>/<YYYY-MM-DD_HH-MM-SS>.md``, whatever
+the job delivers to (Telegram, local, a Bot Chat). The watcher reads those files, never the jobs' own delivery,
+so following a job here changes nothing about where else its output goes.
+
+A phone says which jobs it follows with ``/herald-push cron follow <json>``: per job ``notify`` (a notification)
+or ``quiet`` (into the Inbox only), plus ``failures`` for a notification when any job's run fails. Runs that
+stayed silent (``[SILENT]``, a script with no output) are never sent.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from .store import DEVICE_ID_RE, Store, _write_private
+
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+RUN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+MODES = ("notify", "quiet")
+MAX_JOBS = 200
+# A run older than this when first seen (a restart, a phone that just followed the job) is old news.
+STALE_SECONDS = 30 * 60
+# Output files are written once, at the end of a run; one this fresh may still be being written.
+SETTLE_SECONDS = 2.0
+MAX_READ = 256 * 1024
+MAX_LABEL = 64
+
+OK = "ok"
+FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class Follow:
+    """What one phone follows: job id to ``notify`` or ``quiet``, and whether any failed run notifies."""
+
+    jobs: Dict[str, str]
+    failures: bool = False
+
+    def wants(self, job_id: str, status: str) -> Optional[bool]:
+        """None to send nothing, else whether the run should notify."""
+        mode = self.jobs.get(job_id)
+        if status == FAILED and self.failures:
+            return True
+        if mode is None:
+            return None
+        return mode == "notify"
+
+    @staticmethod
+    def parse(data: object) -> "Follow":
+        if not isinstance(data, dict):
+            raise ValueError("follow must be an object")
+        jobs = data.get("jobs", {})
+        if not isinstance(jobs, dict) or len(jobs) > MAX_JOBS:
+            raise ValueError("jobs must be an object of at most %d jobs" % MAX_JOBS)
+        clean = {}
+        for job_id, mode in jobs.items():
+            if not isinstance(job_id, str) or not JOB_ID_RE.match(job_id):
+                raise ValueError("bad job id")
+            if mode not in MODES:
+                raise ValueError("mode must be notify or quiet")
+            clean[job_id] = mode
+        failures = data.get("failures", False)
+        if not isinstance(failures, bool):
+            raise ValueError("failures must be true or false")
+        return Follow(clean, failures)
+
+
+class Follows:
+    """Every phone's Follow, in ``cron.json`` beside the device list."""
+
+    def __init__(self, store: Store):
+        self.store = store
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self.store.root / "cron.json"
+
+    def all(self) -> Dict[str, Follow]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        out = {}
+        for device_id, entry in (raw.items() if isinstance(raw, dict) else ()):
+            try:
+                out[device_id] = Follow.parse(entry)
+            except ValueError:
+                continue
+        return out
+
+    def get(self, device_id: str) -> Follow:
+        return self.all().get(device_id, Follow({}))
+
+    def set(self, device_id: str, follow: Follow) -> None:
+        if not DEVICE_ID_RE.match(device_id):
+            raise ValueError("bad device_id")
+        if self.store.get(device_id) is None:
+            raise ValueError("not registered")
+        with self._lock, self.store._lock():
+            data = {k: {"jobs": v.jobs, "failures": v.failures} for k, v in self.all().items()
+                    if self.store.get(k) is not None}
+            data[device_id] = {"jobs": follow.jobs, "failures": follow.failures}
+            _write_private(self.path, data)
+
+
+@dataclass(frozen=True)
+class Run:
+    profile: str
+    job_id: str
+    run: str
+    name: str
+    status: str
+    text: str
+    at: float
+
+
+_HEADER = re.compile(r"^# Cron Job: (.+)$", re.M)
+_STATUS = re.compile(r"^\*\*Status:\*\* (.+)$", re.M)
+_MODE = re.compile(r"^\*\*Mode:\*\* (.+)$", re.M)
+
+
+def _section(doc: str, title: str) -> Optional[str]:
+    """The text under ``## <title>`` up to the next level-2 heading the scheduler wrote, or the end."""
+    match = re.search(r"^## " + re.escape(title) + r"[ \t]*\n", doc, re.M)
+    if not match:
+        return None
+    return doc[match.end():].strip()
+
+
+def parse_run(doc: str) -> Optional[Tuple[str, str, str]]:
+    """(job name, ok or failed, the words to show) from one output file; None for a run that stayed silent."""
+    from .watcher import is_silence
+
+    name_match = _HEADER.search(doc)
+    name = (name_match.group(1).strip() if name_match else "")
+    # The scheduler marks a failed run in the heading too: "<name> (FAILED)".
+    name = re.sub(r"\s*\((FAILED|failed)\)$", "", name)[:MAX_LABEL]
+    status_match = _STATUS.search(doc)
+    status_line = status_match.group(1).strip().lower() if status_match else ""
+    mode_match = _MODE.search(doc)
+    script = bool(mode_match and "no_agent" in mode_match.group(1))
+    if status_line.startswith("silent"):
+        return None
+
+    error = _section(doc, "Error")
+    if error is not None:
+        return name, FAILED, error.strip("`\n ").strip() or "The run failed."
+    response = _section(doc, "Response")
+    if response is not None:
+        if not response or is_silence(response):
+            return None
+        return name, OK, response
+
+    if script:
+        if status_line.startswith("script failed"):
+            # "**Status:** script failed\n\n<output>": the script's own words say why.
+            reason = doc[status_match.end():].strip() if status_match else ""
+            return name, FAILED, reason or "The script failed."
+        # A script's output sits between the header and the closing rule.
+        body = doc.split("\n---\n", 1)[1] if "\n---\n" in doc else ""
+        body = body.rsplit("\n---", 1)[0].strip() if body.rstrip().endswith("---") else body.strip()
+        if not body or is_silence(body):
+            return None
+        return name, OK, body
+
+    # The scheduler's last-ditch form: "# Cron Job: <name>\n\nError: <exc>".
+    tail = doc[name_match.end():].strip() if name_match else doc.strip()
+    if tail.startswith("Error:"):
+        return name, FAILED, tail[len("Error:"):].strip() or "The run failed."
+    return None
+
+
+def output_dirs(homes: Iterable[Tuple[str, Path]]) -> Iterable[Tuple[str, str, Path]]:
+    """(profile, job id, the job's output folder) for every job with output, in every profile."""
+    for profile, home in homes:
+        root = home / "cron" / "output"
+        if not PROFILE_RE.match(profile) or not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for folder in entries:
+            if folder.is_dir() and JOB_ID_RE.match(folder.name):
+                yield profile, folder.name, folder
+
+
+def runs_after(folder: Path, after: str) -> List[Path]:
+    """The job's output files named after ``after``, oldest first."""
+    try:
+        files = [p for p in folder.iterdir() if p.suffix == ".md" and RUN_RE.match(p.stem) and p.stem > after]
+    except OSError:
+        return []
+    return sorted(files, key=lambda p: p.stem)
+
+
+def newest_run(folder: Path) -> str:
+    runs = runs_after(folder, "")
+    return runs[-1].stem if runs else ""
+
+
+def read_run(profile: str, job_id: str, path: Path) -> Optional[Run]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            doc = fh.read(MAX_READ)
+        at = path.stat().st_mtime
+    except OSError:
+        return None
+    parsed = parse_run(doc)
+    if parsed is None:
+        return None
+    name, status, text = parsed
+    return Run(profile, job_id, path.stem, name or job_id, status, text, at)
+
+
+class CronWatcher:
+    """Finds runs finished since the last look. Its marks (job folder to newest run seen) live with the
+    Bot Chat watcher's, under ``cron:<profile>:<job>`` keys."""
+
+    def __init__(self, now=time.time):
+        self.now = now
+
+    def poll(self, homes: Iterable[Tuple[str, Path]], marks: Dict[str, str]) -> Tuple[List[Run], bool]:
+        found: List[Run] = []
+        changed = False
+        for profile, job_id, folder in output_dirs(homes):
+            key = f"cron:{profile}:{job_id}"
+            if key not in marks:
+                # A job seen for the first time starts from now: its history isn't news.
+                marks[key] = newest_run(folder)
+                changed = True
+                continue
+            for path in runs_after(folder, marks[key]):
+                try:
+                    age = self.now() - path.stat().st_mtime
+                except OSError:
+                    continue
+                if age < SETTLE_SECONDS:
+                    break
+                marks[key] = path.stem
+                changed = True
+                if age > STALE_SECONDS:
+                    continue
+                run = read_run(profile, job_id, path)
+                if run is not None:
+                    found.append(run)
+        return found, changed
