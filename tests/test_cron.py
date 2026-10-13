@@ -81,7 +81,7 @@ def test_follow_decides_what_is_sent_and_whether_it_rings():
 
 
 @pytest.mark.parametrize("bad", [
-    {"jobs": {"../x": "notify"}}, {"jobs": {"a": "loud"}}, {"jobs": []}, {"failures": "yes"},
+    {"jobs": {"../x": "notify"}}, {"jobs": {"a": "loud"}}, {"jobs": []}, {"failures": "yes"}, {"default": "loud"},
     {"jobs": {f"j{i}": "quiet" for i in range(cron.MAX_JOBS + 1)}},
 ])
 def test_follow_is_validated(bad):
@@ -107,7 +107,7 @@ def test_cron_command_follows_and_reports(tmp_path):
     store.upsert(Device.parse(data))
     handle = commands.make_handler(store, "t", lambda: True, trusted=lambda: True)
     body = json.dumps({"device_id": data["device_id"], "jobs": {"006998ffc458": "notify"}, "failures": True})
-    assert json.loads(handle("cron follow " + body)) == {"ok": True, "jobs": {"006998ffc458": "notify"}, "failures": True}
+    assert json.loads(handle("cron follow " + body)) == {"ok": True, "jobs": {"006998ffc458": "notify"}, "failures": True, "default": "off"}
     asked = json.loads(handle("cron following " + json.dumps({"device_id": data["device_id"]})))
     assert asked["jobs"] == {"006998ffc458": "notify"}
     assert json.loads(handle("cron follow {\"device_id\": \"nope\"}"))["ok"] is False
@@ -246,3 +246,38 @@ def test_inbox_and_read_commands(tmp_path):
     assert one["ok"] and one["run"]["text"] == "Tuesday"
     assert json.loads(handle("cron read " + json.dumps({**me, "bot": "default", "job": "brief", "run": "nope"})))["ok"] is False
     assert json.loads(handle("cron inbox " + json.dumps({**me, "limit": "x"})))["ok"] is False
+
+
+# ── every job by default ─────────────────────────────────────────────────────
+
+def test_a_default_follows_every_job_but_the_ones_switched_off():
+    follow = cron.Follow.parse({"default": "quiet", "jobs": {"noisy": "off", "brief": "notify", "pulse": "quiet"}})
+    # "pulse" says what the default says, so it isn't kept.
+    assert follow.jobs == {"noisy": "off", "brief": "notify"}
+    assert follow.wants("brand-new-job", cron.OK) is False
+    assert follow.wants("brief", cron.OK) is True
+    assert follow.wants("noisy", cron.OK) is None
+    assert cron.Follow.parse({"jobs": {"a": "off"}}).wants("a", cron.OK) is None
+    # Without a default nothing changes from before: only the listed jobs.
+    assert cron.Follow.parse({"jobs": {"a": "quiet"}}).wants("b", cron.OK) is None
+
+
+def test_a_cron_json_from_before_defaults_reads_as_off(tmp_path):
+    store = Store(tmp_path)
+    data, _ = phone()
+    store.upsert(Device.parse(data))
+    (tmp_path / "cron.json").write_text(json.dumps({data["device_id"]: {"jobs": {"a": "quiet"}, "failures": False}}))
+    follow = cron.Follows(store).get(data["device_id"])
+    assert follow.default == "off" and follow.follows("a") and not follow.follows("b")
+
+
+def test_the_inbox_lists_every_job_when_following_all(tmp_path):
+    root = tmp_path / "root"
+    write_run(root, "brief", "2026-10-12_08-00-00", agent_run(response="Morning"))
+    write_run(root, "pulse", "2026-10-12_13-00-00", agent_run(name="pulse", response="Tickets"))
+    write_run(root, "noisy", "2026-10-12_14-00-00", agent_run(name="noisy", response="Spam"))
+    write_run(root, "quiet", "2026-10-12_15-00-00", agent_run(name="quiet", response="[SILENT]"))
+    homes = list(watcher.profile_homes(root))
+    runs = cron.inbox(homes, cron.Follow.parse({"default": "quiet", "jobs": {"noisy": "off"}}))
+    # The silent job brings nothing, and the one switched off stays out.
+    assert sorted(r["job"] for r in runs) == ["brief", "pulse"]

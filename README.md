@@ -39,8 +39,9 @@ Finished cron runs for Herald's Inbox, for the jobs a phone follows.
 - **Read from the output files.** Hermes writes every finished run to `<home>/cron/output/<job>/<time>.md`,
   whatever the job delivers to. The watcher reads those, in every profile, so a job keeps going to Telegram or
   wherever it went before; following it here only adds the phone.
-- **Per job, per phone.** Herald sends `/herald-push cron follow` with `device_id`, `jobs` (job id to `notify`
-  or `quiet`) and `failures` (any failed run notifies, followed or not). `cron following` reads it back. The
+- **Per job, per phone.** Herald sends `/herald-push cron follow` with `device_id`, `jobs` (job id to `notify`,
+  `quiet` or `off`), `default` (what every job not listed does, `off` unless asked; with `quiet` or `notify` a
+  job made later follows too) and `failures` (any failed run notifies, followed or not). `cron following` reads it back. The
   list is in `cron.json` (0600) and is kept per registered phone.
 - **What is sent.** A `cron_run` push: `bot` (profile), `job`, `run` (the output file's name), `label` (the
   job's name), `status` (`ok` or `failed`), `notify`, `at` and the start of the output as `text` (about 1,800

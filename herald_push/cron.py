@@ -25,6 +25,8 @@ JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 RUN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MODES = ("notify", "quiet")
+# A job can be switched off on its own, when the phone follows every job by default.
+JOB_MODES = MODES + ("off",)
 MAX_JOBS = 200
 # A run older than this when first seen (a restart, a phone that just followed the job) is old news.
 STALE_SECONDS = 30 * 60
@@ -45,17 +47,26 @@ FAILED = "failed"
 
 @dataclass(frozen=True)
 class Follow:
-    """What one phone follows: job id to ``notify`` or ``quiet``, and whether any failed run notifies."""
+    """What one phone follows: job id to ``notify``, ``quiet`` or ``off``; ``default``, what every job not listed
+    does (``off`` unless the phone asked for more: a job made later then follows too); and whether any failed
+    run notifies."""
 
     jobs: Dict[str, str]
     failures: bool = False
+    default: str = "off"
+
+    def mode(self, job_id: str) -> str:
+        return self.jobs.get(job_id, self.default)
+
+    def follows(self, job_id: str) -> bool:
+        return self.mode(job_id) != "off"
 
     def wants(self, job_id: str, status: str) -> Optional[bool]:
         """None to send nothing, else whether the run should notify."""
-        mode = self.jobs.get(job_id)
+        mode = self.mode(job_id)
         if status == FAILED and self.failures:
             return True
-        if mode is None:
+        if mode == "off":
             return None
         return mode == "notify"
 
@@ -66,17 +77,25 @@ class Follow:
         jobs = data.get("jobs", {})
         if not isinstance(jobs, dict) or len(jobs) > MAX_JOBS:
             raise ValueError("jobs must be an object of at most %d jobs" % MAX_JOBS)
+        default = data.get("default", "off")
+        if default not in JOB_MODES:
+            raise ValueError("default must be notify, quiet or off")
         clean = {}
         for job_id, mode in jobs.items():
             if not isinstance(job_id, str) or not JOB_ID_RE.match(job_id):
                 raise ValueError("bad job id")
-            if mode not in MODES:
-                raise ValueError("mode must be notify or quiet")
-            clean[job_id] = mode
+            if mode not in JOB_MODES:
+                raise ValueError("mode must be notify, quiet or off")
+            # What the default already says needn't be kept.
+            if mode != default:
+                clean[job_id] = mode
         failures = data.get("failures", False)
         if not isinstance(failures, bool):
             raise ValueError("failures must be true or false")
-        return Follow(clean, failures)
+        return Follow(clean, failures, default)
+
+    def to_json(self) -> dict:
+        return {"jobs": self.jobs, "failures": self.failures, "default": self.default}
 
 
 class Follows:
@@ -112,9 +131,8 @@ class Follows:
         if self.store.get(device_id) is None:
             raise ValueError("not registered")
         with self._lock, self.store._lock():
-            data = {k: {"jobs": v.jobs, "failures": v.failures} for k, v in self.all().items()
-                    if self.store.get(k) is not None}
-            data[device_id] = {"jobs": follow.jobs, "failures": follow.failures}
+            data = {k: v.to_json() for k, v in self.all().items() if self.store.get(k) is not None}
+            data[device_id] = follow.to_json()
             _write_private(self.path, data)
 
 
@@ -277,7 +295,7 @@ def inbox(homes: Iterable[Tuple[str, Path]], follow: Follow, limit: int = 50, be
     limit = max(1, min(int(limit), MAX_LIST))
     found: List[Run] = []
     for profile, job_id, folder in output_dirs(homes):
-        followed = job_id in follow.jobs
+        followed = follow.follows(job_id)
         if not followed and not follow.failures:
             continue
         for path in reversed(runs_after(folder, "")[-PER_JOB:]):

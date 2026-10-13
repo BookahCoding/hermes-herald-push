@@ -102,7 +102,7 @@ def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
 
 def cron_command(store: Store, raw: str, reply: Callable[..., str], root: Optional[Path] = None) -> str:
     """``cron follow <json>``: the jobs a registered phone follows (``device_id``, ``jobs`` as job id to
-    ``notify`` or ``quiet``, ``failures``). ``cron following <json>``: what it follows now. ``cron inbox <json>``: the
+    ``notify``, ``quiet`` or ``off``, ``default`` for every job not listed, ``failures``). ``cron following <json>``: what it follows now. ``cron inbox <json>``: the
     runs it follows, newest first (``limit``, ``before``). ``cron read <json>``: one run in full (``bot``, ``job``,
     ``run``). A phone's pushes are encrypted to it alone, so naming another phone's id only changes what that
     phone is sent; the runs themselves are the gateway's, which the dashboard can read anyway."""
@@ -135,7 +135,7 @@ def cron_command(store: Store, raw: str, reply: Callable[..., str], root: Option
     elif op != "following":
         return reply(ok=False, error=USAGE)
     current = follows.get(device_id)
-    return reply(ok=True, jobs=current.jobs, failures=current.failures)
+    return reply(ok=True, jobs=current.jobs, failures=current.failures, default=current.default)
 
 
 def make_handler(store: Store, version: str, watching: Callable[[], bool],
