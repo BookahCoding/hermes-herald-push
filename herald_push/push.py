@@ -40,17 +40,28 @@ def clip(text: str) -> str:
 
 
 def envelope_for(device: Device, payload: dict, sig_key) -> str:
-    plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    env = crypto.seal(plaintext, device.push_topic, crypto.G2P, crypto.decode_public(device.enc_pub), sig_key)
-    body = env.to_json()
-    if len(body.encode("utf-8")) > MAX_BODY:
-        raise ValueError("push message too large")
-    return body
+    """The sealed message, its text cut further while it's over ntfy's limit: JSON escaping can still grow a
+    clipped text past it (control characters, many short lines). The phone can read the rest over the socket."""
+    text = payload.get("text")
+    while True:
+        plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        env = crypto.seal(plaintext, device.push_topic, crypto.G2P, crypto.decode_public(device.enc_pub), sig_key)
+        body = env.to_json()
+        if len(body.encode("utf-8")) <= MAX_BODY:
+            return body
+        if not isinstance(text, str) or len(text) <= 1:
+            raise ValueError("push message too large")
+        text = text[: len(text) * 3 // 4 - 1].rstrip() + "…"
+        payload = dict(payload, text=text)
 
 
 def publish(device: Device, payload: dict, sig_key, client: Optional[httpx.Client] = None) -> bool:
     """True when ntfy took it. No title, tags or priority headers: they'd travel in the clear."""
-    body = envelope_for(device, payload, sig_key)
+    try:
+        body = envelope_for(device, payload, sig_key)
+    except ValueError:
+        log.warning("herald-push: a %s message is too large to send", payload.get("type"))
+        return False
     url = f"{device.server}/{device.push_topic}"
     try:
         if client is None:

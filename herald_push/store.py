@@ -12,6 +12,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -25,6 +26,7 @@ DEVICE_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 SERVER_RE = re.compile(r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 MAX_DEVICES = 20
 MAX_NAME = 64
+_REPLACE_TRIES = 6
 
 
 class InvalidRegistration(ValueError):
@@ -87,7 +89,15 @@ def _write_private(path: Path, data: object) -> None:
             json.dump(data, fh, indent=1)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        for attempt in range(_REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows refuses to replace a file another process has open for a moment (a reader).
+                if sys.platform != "win32" or attempt == _REPLACE_TRIES - 1:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -207,3 +217,14 @@ class Store:
 
     def save_marks(self, marks: Dict[str, int]) -> None:
         _write_private(self.root / "marks.json", marks)
+
+    def cron_marks(self) -> Dict[str, str]:
+        """Per job's output folder (``cron:<profile>:<job>``), the newest run the watcher has seen."""
+        try:
+            raw = json.loads((self.root / "cron-marks.json").read_text(encoding="utf-8"))
+            return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def save_cron_marks(self, marks: Dict[str, str]) -> None:
+        _write_private(self.root / "cron-marks.json", marks)

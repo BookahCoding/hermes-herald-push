@@ -1,16 +1,31 @@
 name: herald-push
 label: Herald push
-version: 0.1.1
+version: 0.4.2
 manifest_version: 2
 requires_hermes: ">=0.21.5"
 description: >
   End-to-end encrypted notifications for the Herald Android app, through ntfy, so a phone hears from its
   bots even when it can't reach the gateway (off the tailnet, on mobile data). Every message is encrypted
   to the phone's key and signed by the gateway; the ntfy server only carries opaque envelopes. Phones
-  register themselves from Herald over the authenticated dashboard connection.
+  register themselves from Herald over the authenticated dashboard connection. Also the phone tools: the
+  agent can read the phone's battery, place or calendar, set an alarm and more, only the tools the user
+  switched on in Herald, and every change asks on the phone first.
 author: Giton22
 homepage: https://github.com/Giton22/hermes-herald-push
 license: MIT
+provides_tools:
+  - phone_battery
+  - phone_network
+  - phone_sound
+  - phone_alarm
+  - phone_screen_time
+  - phone_open
+  - phone_clipboard
+  - phone_location
+  - phone_geofence
+  - phone_calendar
+  - phone_contacts
+  - phone_health
 config_schema:
   enabled:
     type: bool

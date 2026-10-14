@@ -19,7 +19,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 
-from . import push
+from . import cron, push
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -229,6 +229,10 @@ class Watcher:
         self._tips: Dict[str, str] = {}
         # Per bot: the texts pushed lately and when, so a compression copy isn't pushed twice.
         self._pushed: Dict[str, Dict[str, float]] = {}
+        self.follows = cron.Follows(store)
+        self._cron = cron.CronWatcher(now=lambda: self.now())
+        self._cron_marks: Dict[str, str] = {}
+        self._cron_marks_loaded = False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -266,9 +270,9 @@ class Watcher:
                 self._stop.wait(POLL_SECONDS)
 
     def poll(self, client: Optional[httpx.Client] = None) -> int:
-        """One pass over every bot; returns how many pushes went out."""
+        """One pass over every bot and every cron job; returns how many pushes went out."""
         devices = self.store.devices()
-        sent = 0
+        sent = self.poll_cron(devices, client)
         changed = False
         for profile, home in profile_homes(self.root):
             try:
@@ -321,4 +325,30 @@ class Watcher:
             self.store.save_marks(self._marks)
             self._marks_dirty = False
             self._marks_saved_at = self.now()
+        return sent
+
+    def poll_cron(self, devices, client: Optional[httpx.Client] = None) -> int:
+        """Finished cron runs, to each phone that follows the job (or every failure, when it asked)."""
+        if not self._cron_marks_loaded:
+            self._cron_marks = self.store.cron_marks()
+            self._cron_marks_loaded = True
+        runs, changed = self._cron.poll(profile_homes(self.root), self._cron_marks)
+        if changed:
+            self.store.save_cron_marks(self._cron_marks)
+        if not runs or not devices:
+            return 0
+        follows = self.follows.all()
+        _, sig = self.store.identity()[1:]
+        sent = 0
+        for run in runs:
+            for device in devices:
+                notify = follows.get(device.device_id, cron.Follow({})).wants(run.job_id, run.status)
+                if notify is None:
+                    continue
+                payload = push.message(
+                    "cron_run", bot=run.profile, job=run.job_id, run=run.run, label=run.name,
+                    status=run.status, notify=notify, text=push.clip(run.text), at=int(run.at),
+                )
+                if push.publish(device, payload, sig, client):
+                    sent += 1
         return sent
