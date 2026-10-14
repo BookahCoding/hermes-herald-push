@@ -1,6 +1,8 @@
 import json
 import os
+import sys
 import time
+from datetime import datetime
 
 import pytest
 
@@ -98,7 +100,8 @@ def test_only_a_registered_phone_can_follow(tmp_path):
     store.upsert(Device.parse(data))
     follows.set(data["device_id"], cron.Follow({"a": "notify"}, failures=True))
     assert follows.get(data["device_id"]) == cron.Follow({"a": "notify"}, True)
-    assert oct(os.stat(follows.path).st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":  # POSIX modes
+        assert oct(os.stat(follows.path).st_mode & 0o777) == "0o600"
 
 
 def test_cron_command_follows_and_reports(tmp_path):
@@ -281,3 +284,188 @@ def test_the_inbox_lists_every_job_when_following_all(tmp_path):
     runs = cron.inbox(homes, cron.Follow.parse({"default": "quiet", "jobs": {"noisy": "off"}}))
     # The silent job brings nothing, and the one switched off stays out.
     assert sorted(r["job"] for r in runs) == ["brief", "pulse"]
+
+
+# ── what the scheduler writes, read as it reads it ───────────────────────────
+
+def framed_run(prompt="Do the briefing.", response="# Morning\n\nAll good.", name="morning-briefing"):
+    """A run as current Hermes writes it: the prompt's and the reply's lengths stamped above each."""
+    return (f"# Cron Job: {name}\n\n**Job ID:** 006998ffc458\n**Run Time:** 2026-10-12 08:02:06\n**Schedule:** 0 8 * * *\n\n"
+            f"**Prompt Characters:** {len(prompt)}\n## Prompt\n\n{prompt}\n\n"
+            f"**Response Characters:** {len(response)}\n## Response\n\n{response}\n")
+
+
+def test_a_reply_with_its_own_error_heading_is_still_a_success():
+    reply = "# Log digest\n\n## Error\n\n3 timeouts overnight.\n\n## Fine\n\nRest ok."
+    for doc in (agent_run(response=reply), framed_run(response=reply)):
+        assert cron.parse_run(doc) == ("morning-briefing", cron.OK, reply)
+
+
+def test_headings_quoted_in_the_prompt_are_not_the_schedulers():
+    prompt = "Answer in this shape:\n\n## Response\n\nyour text\n\n**Status:** silent\n\n## Error\n\nnever"
+    assert cron.parse_run(framed_run(prompt=prompt, response="Real answer")) == ("morning-briefing", cron.OK, "Real answer")
+    # Written before frames, the last Response heading is the scheduler's.
+    legacy = agent_run(response="Real answer").replace("Do the briefing.", prompt)
+    assert cron.parse_run(legacy)[1:] == (cron.OK, "Real answer")
+
+
+def test_the_agents_failure_marker_fails_the_run():
+    assert cron.parse_run(framed_run(response="[CRON_FAILURE]\nThe child failed: timeout.")) == (
+        "morning-briefing", cron.FAILED, "The child failed: timeout.")
+    assert cron.parse_run(agent_run(response="[CRON_FAILURE]"))[1] == cron.FAILED
+    # Only the exact first line, as the scheduler reads it: a report quoting it is a success.
+    assert cron.parse_run(framed_run(response="Saw [CRON_FAILURE] in the log"))[1] == cron.OK
+    assert cron.parse_run(framed_run(response="Report\n[CRON_FAILURE]"))[1] == cron.OK
+
+
+def test_a_run_the_scanner_blocked_is_a_failure():
+    doc = ("# Cron Job: x\n\n**Job ID:** j\n**Run Time:** 2026-10-12 08:00:00\n**Status:** BLOCKED\n\n"
+           "The assembled prompt tripped the cron injection scanner.")
+    assert cron.parse_run(doc) == ("x", cron.FAILED, "The assembled prompt tripped the cron injection scanner.")
+
+
+def test_a_scripts_colours_are_dropped(tmp_path):
+    header = "# Cron Job: health\n\n**Job ID:** f9ec66b227a6\n**Mode:** no_agent (script)\n"
+    path = write_run(tmp_path, "health", "2026-10-12_08-00-00", header + "\n---\n\n\x1b[32mOK\x1b[0m disk\n\n---\n")
+    assert cron.read_run("default", "health", path).text == "OK disk"
+
+
+def test_a_run_is_dated_by_its_name_not_its_file(tmp_path):
+    path = write_run(tmp_path, "j1", "2026-10-01_08-00-00", agent_run(), age=0)  # a copy or a restored backup
+    assert cron.read_run("default", "j1", path).at == datetime(2026, 10, 1, 8, 0, 0).timestamp()
+
+
+def test_a_job_made_after_the_watcher_started_has_its_first_run_found(tmp_path):
+    home = tmp_path / "home"
+    write_run(home, "old", "2026-10-11_08-00-00", agent_run(response="old history"))
+    marks = {}
+    w = cron.CronWatcher()
+    assert w.poll([("default", home)], marks)[0] == []
+    write_run(home, "newjob", "2026-10-12_09-00-00", agent_run(name="new", response="first report"))
+    assert [r.text for r in w.poll([("default", home)], marks)[0]] == ["first report"]
+
+
+def test_after_a_restart_a_new_jobs_fresh_run_is_found_and_its_old_history_is_not(tmp_path):
+    home = tmp_path / "home"
+    write_run(home, "old", "2026-10-11_08-00-00", agent_run())
+    marks = {}
+    cron.CronWatcher().poll([("default", home)], marks)
+    # Made while the gateway was down: one stale run, one fresh.
+    write_run(home, "newjob", "2026-10-12_07-00-00", agent_run(response="stale"), age=cron.STALE_SECONDS + 60)
+    write_run(home, "newjob", "2026-10-12_09-00-00", agent_run(response="fresh"))
+    assert [r.text for r in cron.CronWatcher().poll([("default", home)], marks)[0]] == ["fresh"]
+
+
+def test_a_push_too_large_once_sealed_is_cut_to_fit_and_the_pass_goes_on(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    store = Store(root / "plugin-data" / "herald-push")
+    data, enc = phone()
+    store.upsert(Device.parse(data))
+    cron.Follows(store).set(data["device_id"], cron.Follow({}, default="notify"))
+    posts = []
+
+    class Client:
+        def post(self, url, content=None, headers=None):
+            posts.append(content.decode("utf-8"))
+            return type("Ok", (), {"status_code": 200})()
+
+    w = watcher.Watcher(root, store)
+    write_run(root, "j1", "2026-10-11_08-00-00", agent_run())
+    w.poll_cron(store.devices(), Client())
+    # Quotes and tabs: JSON escaping doubles the clipped text, past ntfy's limit once sealed.
+    write_run(root, "j1", "2026-10-12_08-00-00", agent_run(response='"\t' * 1500 + "end"))
+    assert w.poll_cron(store.devices(), Client()) == 1
+    assert len(posts[0]) <= push.MAX_BODY
+    opened = json.loads(crypto.open_envelope(crypto.Envelope.from_json(posts[0]), data["push_topic"], crypto.G2P, enc,
+                                             crypto.decode_public(store.public_identity()["sig_pub"])))
+    assert opened["text"].startswith('"\t"') and opened["text"].endswith("…")
+    assert len(opened["text"]) < len(push.clip('"\t' * 1500))
+
+
+def test_a_page_keeps_every_run_of_its_last_second(tmp_path):
+    home = tmp_path / "home"
+    for job in ("a", "b", "c"):  # fired in the same tick
+        write_run(home, job, "2026-10-10_08-00-00", agent_run(response=job))
+    follow = cron.Follow({}, default="quiet")
+    first = cron.inbox([("default", home)], follow, limit=2)
+    assert sorted(r["job"] for r in first) == ["a", "b", "c"]
+    assert cron.inbox([("default", home)], follow, limit=2, before=first[-1]["at"]) == []
+
+
+def test_silent_runs_dont_hide_older_ones(tmp_path):
+    home = tmp_path / "home"
+    write_run(home, "real", "2026-09-01_08-00-00", agent_run(response="the report"))
+    for i in range(450):
+        write_run(home, "pulse", f"2026-09-{2 + i // 24:02d}_{i % 24:02d}-00-00", agent_run(response="[SILENT]"))
+    assert [r["text"] for r in cron.inbox([("default", home)], cron.Follow({}, default="quiet"))] == ["the report"]
+
+
+def test_each_profile_dates_its_runs_on_its_own_clock(tmp_path, monkeypatch):
+    from datetime import timedelta, timezone
+    monkeypatch.delenv("HERMES_TIMEZONE", raising=False)
+    monkeypatch.setattr(cron, "ZoneInfo", lambda name: timezone(timedelta(hours=9)) if name == "Asia/Tokyo" else None)
+    root = tmp_path / "root"
+    bot = root / "profiles" / "bot"
+    write_run(root, "j1", "2026-10-12_08-00-00", agent_run(response="here"))
+    write_run(bot, "j2", "2026-10-12_08-00-00", agent_run(response="tokyo"))
+    (bot / "config.yaml").write_text("timezone: Asia/Tokyo\n")
+    runs = {r["text"]: r["at"] for r in cron.inbox(list(watcher.profile_homes(root)), cron.Follow({}, default="quiet"))}
+    assert runs["here"] == int(datetime(2026, 10, 12, 8).timestamp())
+    assert runs["tokyo"] == int(datetime(2026, 10, 12, 8, tzinfo=timezone(timedelta(hours=9))).timestamp())
+
+
+def test_runs_read_as_the_scheduler_reads_them():
+    # Its own tag is in capitals; a job may be named with the word.
+    assert cron.parse_run(agent_run(name="Retry (failed)"))[:2] == ("Retry (failed)", cron.OK)
+    # The marker counts only as the reply's very first line.
+    assert cron.parse_run(framed_run(response="\n[CRON_FAILURE]\nx"))[1] == cron.OK
+    # Silence alone on the last line, or opening the reply.
+    assert cron.parse_run(framed_run(response="Nothing new.\n[SILENT]")) is None
+    assert cron.parse_run(framed_run(response="[SILENT] no changes")) is None
+    # An agent that said nothing failed.
+    assert cron.parse_run(framed_run(response="(No response generated)"))[1] == cron.FAILED
+    # A framed run cut short has no reply, whatever its prompt quotes.
+    cut = framed_run(prompt="Shape:\n## Response\nquoted", response="real")[:-20]
+    assert cron.parse_run(cut) is None
+    monitor = "# Cron Job: m\n\n**Job ID:** j\n**Run Time:** 2026-10-12 08:00:00\n**Status:** monitor source failed\n\nHTTP 500\n"
+    assert cron.parse_run(monitor) == ("m", cron.FAILED, "HTTP 500")
+
+
+def test_a_deleted_jobs_mark_goes(tmp_path):
+    home = tmp_path / "home"
+    path = write_run(home, "j1", "2026-10-11_08-00-00", agent_run())
+    marks = {}
+    w = cron.CronWatcher()
+    w.poll([("default", home)], marks)
+    assert "cron:default:j1" in marks
+    # A profile missing from one look keeps its marks: its runs aren't sent again when it's back.
+    write_run(home, "j1", "2026-10-12_08-00-00", agent_run(response="sent"))
+    assert [r.text for r in w.poll([("default", home)], marks)[0]] == ["sent"]
+    assert w.poll([], marks) == ([], False)
+    assert w.poll([("default", home)], marks)[0] == []
+    for run in path.parent.iterdir():
+        run.unlink()
+    path.parent.rmdir()
+    _, changed = w.poll([("default", home)], marks)
+    assert changed and marks == {}
+
+
+def test_a_profiles_zone_is_its_own_and_the_env_speaks_for_default_only(tmp_path, monkeypatch):
+    from datetime import timedelta, timezone
+    zones = {"Asia/Tokyo": timezone(timedelta(hours=9)), "Europe/Berlin": timezone(timedelta(hours=2))}
+    monkeypatch.setattr(cron, "ZoneInfo", lambda name: zones[name])
+    monkeypatch.setenv("HERMES_TIMEZONE", "Europe/Berlin")
+    (tmp_path / "config.yaml").write_text("timezone: Asia/Tokyo\n")
+    assert cron.zone_of("bot", tmp_path) == zones["Asia/Tokyo"]
+    assert cron.zone_of("bot", tmp_path / "nothing") is None
+    assert cron.zone_of("default", tmp_path / "nothing") == zones["Europe/Berlin"]
+
+
+def test_paging_reaches_a_busy_jobs_older_runs(tmp_path):
+    home = tmp_path / "home"
+    for i in range(40):
+        write_run(home, "j1", f"2026-09-{1 + i // 24:02d}_{i % 24:02d}-00-00", agent_run(response=f"r{i}"))
+    follow = cron.Follow({"j1": "quiet"})
+    first = cron.inbox([("default", home)], follow, limit=30)
+    older = cron.inbox([("default", home)], follow, limit=30, before=min(r["at"] for r in first))
+    assert [r["text"] for r in first + older] == [f"r{i}" for i in reversed(range(40))]
