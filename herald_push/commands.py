@@ -126,7 +126,7 @@ def cron_command(store: Store, raw: str, reply: Callable[..., str], root: Option
         if not all(isinstance(v, str) for v in (bot, job, run)):
             return reply(ok=False, error="bad bot, job or run")
         found = cron.read(homes, bot, job, run)
-        return reply(ok=found is not None, run=found) if found else reply(ok=False, error="no such run")
+        return reply(ok=True, run=found) if found else reply(ok=False, error="no such run")
     if op == "follow":
         try:
             follows.set(device_id, cron.Follow.parse(data))
