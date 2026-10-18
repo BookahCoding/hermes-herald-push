@@ -79,8 +79,10 @@ CALL_NOTES = {
             "instead.",
     "quiet": "The user set quiet hours on their phone, so it didn't ring, and another call won't ring before they "
              "end. Reach them another way now: send a message, or set a reminder for after quiet hours. Only if it "
-             "truly can't wait, say so at the start of your message.",
+             "truly can't wait, start your message by saying it's urgent.",
 }
+# How the phone gives the end of quiet hours: "07:00".
+_CLOCK = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 UNREACHABLE_NOTE = ("The call didn't get through to the user's phone. If it still matters, reach them another way "
                     "now, for example a message or a reminder.")
 
@@ -236,7 +238,12 @@ def call_result(raw: str) -> str:
         data = None
     status = data.get("status") if isinstance(data, dict) else None
     if status in CALL_NOTES:
-        return json.dumps({"status": status, "note": CALL_NOTES[status]})
+        out = {"status": status, "note": CALL_NOTES[status]}
+        until = data.get("until")
+        if status == "quiet" and isinstance(until, str) and _CLOCK.fullmatch(until):
+            out["until"] = until
+            out["note"] += f" Quiet hours end at {until}, the phone's local time."
+        return json.dumps(out)
     error = data.get("error") if isinstance(data, dict) else None
     out = {"status": "unreachable", "note": UNREACHABLE_NOTE}
     if isinstance(error, str):
