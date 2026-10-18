@@ -39,6 +39,15 @@ def clip(text: str) -> str:
     return cut.rstrip() + "…"
 
 
+def clip_bytes(text: str, limit: int) -> str:
+    """[text] cut to at most [limit] bytes of UTF-8, at a character's end."""
+    text = text.strip()
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    cut = text.encode("utf-8")[: max(0, limit - 3)].decode("utf-8", "ignore")
+    return cut.rstrip() + "…"
+
+
 def envelope_for(device: Device, payload: dict, sig_key) -> str:
     """The sealed message, its text cut further while it's over ntfy's limit: JSON escaping can still grow a
     clipped text past it (control characters, many short lines). The phone can read the rest over the socket."""

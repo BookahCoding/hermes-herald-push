@@ -9,13 +9,29 @@ from pathlib import Path
 
 from . import push
 from .commands import make_handler
-from .phone import Phones, register_tools
+from .phone import CALL_TOOL, Phones, register_tools
 from .store import Store
 from .watcher import Watcher, is_long_lived_process
 
 log = logging.getLogger(__name__)
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
+
+# A ring's push: what it says fits ntfy's 4096-byte message limit once sealed (base64 grows it by a third).
+MAX_REASON_BYTES = 600
+MAX_DETAILS_BYTES = 1200
+
+
+def wake_message(request: dict) -> dict:
+    """The push that tells a phone about [request]: a nudge to fetch it, or for a ring the call itself."""
+    if request.get("tool") != CALL_TOOL:
+        return push.message("phone_request", request_id=request["id"])
+    args = request.get("args") or {}
+    details = args.get("details")
+    return push.message(
+        "phone_call", request_id=request["id"], session=request.get("session") or None,
+        expires=request.get("expires"), reason=push.clip_bytes(str(args.get("reason") or ""), MAX_REASON_BYTES),
+        details=push.clip_bytes(details, MAX_DETAILS_BYTES) if isinstance(details, str) else None)
 
 # One watcher per process, however many profiles load the plugin.
 _watcher_lock = threading.Lock()
@@ -40,12 +56,14 @@ def register(ctx) -> None:
     def watching() -> bool:
         return _watcher is not None
 
-    def wake(device_id: str, request_id: str) -> None:
-        """Tells a phone registered for push that a tool call waits for it."""
+    def wake(device_id: str, request: dict) -> None:
+        """Tells a phone registered for push that a tool call waits for it. A ring carries the call itself, so
+        the phone rings even while it can't reach the gateway."""
         device = store.get(device_id)
-        if device is not None:
-            _, _, sig = store.identity()
-            push.publish(device, push.message("phone_request", request_id=request_id), sig)
+        if device is None:
+            return
+        _, _, sig = store.identity()
+        push.publish(device, wake_message(request), sig)
 
     phones = Phones(store, wake)
     register_tools(ctx, phones)
