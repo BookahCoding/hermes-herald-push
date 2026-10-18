@@ -56,7 +56,7 @@ Finished cron runs for Herald's Inbox, for the jobs a phone follows.
 
 Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery`, `phone_network`,
 `phone_sound`, `phone_alarm`, `phone_screen_time`, `phone_open`, `phone_clipboard`, `phone_location`,
-`phone_geofence`, `phone_calendar`, `phone_contacts` and `phone_health`.
+`phone_geofence`, `phone_calendar`, `phone_contacts`, `phone_health` and `phone_call_me` (0.5.0).
 
 - **Off until the user turns them on.** Each tool has its own switch in Herald (Settings → Phone tools). Herald
   tells the gateway which ones are on with `/herald-push phone tools`, and a tool no phone has on is not
@@ -82,6 +82,14 @@ Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery
   chat's tool event, a push, or when it connects, reads it with `/herald-push phone pending` and answers with
   `/herald-push phone answer`, both over the dashboard's authenticated connection only. Reads wait 30 seconds
   for the phone, changes 2 minutes; then the agent is told the phone didn't answer.
+- **The agent calls you.** `phone_call_me(reason, details?)` rings the user's own phone like an incoming call
+  (and Herald on their watch). It takes no number: it can only ring a phone that switched it on in Herald
+  (Settings → Phone tools → Calls). Answering puts Hermes on the line by voice, opening with the reason. The
+  tool waits up to 75 seconds (the phone rings 45) and returns `answered`, `declined`, `no_answer`, `busy`
+  (already on a call with Hermes) or `unreachable`, each with a note; anything but `answered` tells the agent
+  to reach the user another way. The push carries the reason and details (end-to-end encrypted, like every
+  push), so the phone rings even when Herald isn't connected; the answer comes back over the socket. It works
+  from scheduled jobs too, for "call me at 7:30".
 
 ## Tests
 

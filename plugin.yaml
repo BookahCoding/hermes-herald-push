@@ -1,6 +1,6 @@
 name: herald-push
 label: Herald push
-version: 0.4.2
+version: 0.5.0
 manifest_version: 2
 requires_hermes: ">=0.21.5"
 description: >
@@ -9,7 +9,8 @@ description: >
   to the phone's key and signed by the gateway; the ntfy server only carries opaque envelopes. Phones
   register themselves from Herald over the authenticated dashboard connection. Also the phone tools: the
   agent can read the phone's battery, place or calendar, set an alarm and more, only the tools the user
-  switched on in Herald, and every change asks on the phone first.
+  switched on in Herald, and every change asks on the phone first. With Calls on in Herald, the agent can
+  ring the user's own phone and watch for something urgent, and talk it over by voice.
 author: Giton22
 homepage: https://github.com/Giton22/hermes-herald-push
 license: MIT
@@ -26,6 +27,7 @@ provides_tools:
   - phone_calendar
   - phone_contacts
   - phone_health
+  - phone_call_me
 config_schema:
   enabled:
     type: bool
