@@ -58,6 +58,28 @@ SID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 # How long the agent waits. Reads answer at once; a change waits for you to allow it on the phone.
 READ_TIMEOUT = 30
 CONFIRM_TIMEOUT = 120
+# A call rings 45 seconds on the phone; the rest is for the push to get there and the answer to come back.
+CALL_TIMEOUT = 75
+
+# The agent rings the user's own phone. It never takes a number: the phone it rings is the user's own Herald.
+CALL_TOOL = "phone_call_me"
+MAX_REASON = 300
+MAX_DETAILS = 2000
+
+# What the agent reads with each way a call can end.
+CALL_NOTES = {
+    "answered": "The user picked up. They're talking with Hermes by voice now, and the call opened with your "
+                "reason. What they say comes in as their next messages. End this turn with one short line; don't "
+                "repeat the reason.",
+    "declined": "The user declined the call. If it still matters, reach them another way now, for example a "
+                "message or a reminder.",
+    "no_answer": "The user didn't pick up. If it still matters, reach them another way now, for example a "
+                 "message or a reminder.",
+    "busy": "The user is already on a call with Hermes, so it didn't ring. If it still matters, send a message "
+            "instead.",
+}
+UNREACHABLE_NOTE = ("The call didn't get through to the user's phone. If it still matters, reach them another way "
+                    "now, for example a message or a reminder.")
 
 
 def _schema(name: str, description: str, properties: dict, required: Optional[List[str]] = None) -> dict:
@@ -185,13 +207,56 @@ TOOLS: Dict[str, tuple] = {
             "from": {"type": "string", "description": _ISO},
             "to": {"type": "string", "description": _ISO},
         }, ["metric"]), READ_TIMEOUT, "❤️"),
+    CALL_TOOL: (_schema(
+        CALL_TOOL,
+        "Ring the user's phone (and watch) like an incoming call. When they pick up, Hermes talks with them by "
+        "voice, starting with your reason. It only ever calls the user, never anyone else. Use it when something is "
+        "important or urgent enough to interrupt them (an alert, a reminder that must not be missed, a decision "
+        "that can't wait), or when the user asked to be called, also from a scheduled job (\"call me at 7:30\"). "
+        "Waits until the call is answered, declined or not answered (about 45 seconds of ringing) and returns that "
+        "status. When it isn't answered, reach the user another way.",
+        {
+            "reason": {"type": "string", "maxLength": MAX_REASON,
+                       "description": "Why you call, in one or two sentences. Hermes opens the call with it."},
+            "details": {"type": "string", "maxLength": MAX_DETAILS,
+                        "description": "Optional background for the call: what happened, deadlines, the options."},
+        }, ["reason"]), CALL_TIMEOUT, "📞"),
 }
+
+
+def call_result(raw: str) -> str:
+    """The phone's answer to a call, with what the agent should do next. Anything but a status the phone gave
+    (no phone, no answer in time) means the call didn't get through."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    status = data.get("status") if isinstance(data, dict) else None
+    if status in CALL_NOTES:
+        return json.dumps({"status": status, "note": CALL_NOTES[status]})
+    error = data.get("error") if isinstance(data, dict) else None
+    out = {"status": "unreachable", "note": UNREACHABLE_NOTE}
+    if isinstance(error, str):
+        out["error"] = error
+    return json.dumps(out)
+
+
+def call_args(args: dict) -> Optional[dict]:
+    """[args] of a call, trimmed; None without a reason."""
+    reason = args.get("reason") if isinstance(args, dict) else None
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    out = {"reason": reason.strip()[:MAX_REASON]}
+    details = args.get("details")
+    if isinstance(details, str) and details.strip():
+        out["details"] = details.strip()[:MAX_DETAILS]
+    return out
 
 
 class Phones:
     """Which phones offer which tools, and the requests waiting for them, in ``<data>/phone/``."""
 
-    def __init__(self, store: Store, wake: Optional[Callable[[str, str], None]] = None,
+    def __init__(self, store: Store, wake: Optional[Callable[[str, dict], None]] = None,
                  clock: Callable[[], float] = time.time):
         self.store = store
         self.root = store.root / "phone"
@@ -221,7 +286,8 @@ class Phones:
     def report(self, device_id: str, key: str, name: str, tools: List[str], push_id: Optional[str] = None) -> List[str]:
         """Records what [device_id] has switched on (only tools this plugin knows); returns those. The first
         report binds the phone id to [key]; a later one with another key is refused. [push_id] is the phone's
-        push registration, if any, which a call nudges; it only ever receives a nudge, never the call."""
+        push registration, if any, which a call nudges. Only a ring ([CALL_TOOL]) travels in the push itself, so
+        the phone rings while it can't reach the gateway; every other call is fetched over the socket."""
         if not DEVICE_ID_RE.match(device_id or ""):
             raise ValueError("bad device_id")
         if not KEY_RE.match(key or ""):
@@ -383,7 +449,7 @@ class Phones:
         push_id = (phone or {}).get("push")
         if self.wake is not None and isinstance(push_id, str):
             # The push goes out beside the wait: ntfy may take seconds, and the phone may already be listening.
-            threading.Thread(target=self._wake, args=(push_id, request_id), daemon=True).start()
+            threading.Thread(target=self._wake, args=(push_id, request), daemon=True).start()
         try:
             deadline = now + timeout
             while self.clock() < deadline:
@@ -401,9 +467,9 @@ class Phones:
             for kind in ("req", "res"):
                 _unlink(self._path(request_id, kind))
 
-    def _wake(self, push_id: str, request_id: str) -> None:
+    def _wake(self, push_id: str, request: dict) -> None:
         try:
-            self.wake(push_id, request_id)
+            self.wake(push_id, request)
         except Exception:
             log.warning("herald-push: couldn't wake the phone for a tool", exc_info=True)
 
@@ -572,6 +638,11 @@ def register_tools(ctx, phones: Phones) -> None:
             if on_messaging_platform():
                 return _error("Phone tools only work in chats from Herald, Desktop or the dashboard, not on a "
                               "messaging platform.")
+            if _name == CALL_TOOL:
+                trimmed = call_args(args)
+                if trimmed is None:
+                    return _error("reason is required.")
+                return call_result(phones.call(_name, trimmed, session_id, turn_connection()))
             return phones.call(_name, args, session_id, turn_connection())
 
         def check(_name=name) -> bool:
