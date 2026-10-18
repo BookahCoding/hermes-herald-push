@@ -289,6 +289,13 @@ def test_a_ring_carries_the_call_and_fits_one_push(tmp_path):
     opened = json.loads(crypto.open_envelope(crypto.Envelope.from_json(body), device.push_topic, crypto.G2P, enc,
                                              crypto.decode_public(store.public_identity()["sig_pub"])))
     assert opened["reason"].startswith("日本") and opened["details"].endswith("…")
+    # JSON escaping doubles quotes and backslashes past the byte caps: the details give way, then the reason.
+    escaped = plugin.wake_message(dict(request, args={"reason": '"' * 1000, "details": "\\" * 3000}))
+    body = push.envelope_for(device, escaped, sig)
+    assert len(body) <= push.MAX_BODY
+    opened = json.loads(crypto.open_envelope(crypto.Envelope.from_json(body), device.push_topic, crypto.G2P, enc,
+                                             crypto.decode_public(store.public_identity()["sig_pub"])))
+    assert opened["reason"].startswith('"') and opened["request_id"] == "f" * 32
     # Any other tool is only a nudge: the call is fetched over the socket.
     other = plugin.wake_message({"id": "e" * 32, "tool": "phone_location", "args": {"fresh": True}})
     assert other["type"] == "phone_request" and "args" not in other and "reason" not in other
