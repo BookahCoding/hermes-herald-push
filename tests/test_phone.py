@@ -462,7 +462,7 @@ def test_a_call_takes_no_number_only_a_reason():
     assert set(schema["properties"]) == {"reason", "details"} and schema["required"] == ["reason"]
 
 
-@pytest.mark.parametrize("status", ["answered", "declined", "no_answer", "busy"])
+@pytest.mark.parametrize("status", ["answered", "declined", "no_answer", "busy", "quiet"])
 def test_a_call_returns_how_it_ended_with_what_to_do_next(tmp_path, ctx, status):
     phones = Phones(Store(tmp_path))
     phone.register_tools(ctx, phones)

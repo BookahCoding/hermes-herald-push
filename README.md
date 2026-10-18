@@ -86,7 +86,7 @@ Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery
   (and Herald on their watch). It takes no number: it can only ring a phone that switched it on in Herald
   (Settings → Phone tools → Calls). Answering puts Hermes on the line by voice, opening with the reason. The
   tool waits up to 75 seconds (the phone rings 45) and returns `answered`, `declined`, `no_answer`, `busy`
-  (already on a call with Hermes) or `unreachable`, each with a note; anything but `answered` tells the agent
+  (already on a call with Hermes), `quiet` (quiet hours on the phone, 0.5.1) or `unreachable`, each with a note; anything but `answered` tells the agent
   to reach the user another way. The push carries the reason and details (end-to-end encrypted, like every
   push), so the phone rings even when Herald isn't connected; the answer comes back over the socket. It works
   from scheduled jobs too, for "call me at 7:30".

@@ -77,6 +77,9 @@ CALL_NOTES = {
                  "message or a reminder.",
     "busy": "The user is already on a call with Hermes, so it didn't ring. If it still matters, send a message "
             "instead.",
+    "quiet": "The user set quiet hours on their phone, so it didn't ring, and another call won't ring before they "
+             "end. Reach them another way now: send a message, or set a reminder for after quiet hours. Only if it "
+             "truly can't wait, say so at the start of your message.",
 }
 UNREACHABLE_NOTE = ("The call didn't get through to the user's phone. If it still matters, reach them another way "
                     "now, for example a message or a reminder.")
@@ -214,7 +217,7 @@ TOOLS: Dict[str, tuple] = {
         "important or urgent enough to interrupt them (an alert, a reminder that must not be missed, a decision "
         "that can't wait), or when the user asked to be called, also from a scheduled job (\"call me at 7:30\"). "
         "Waits until the call is answered, declined or not answered (about 45 seconds of ringing) and returns that "
-        "status. When it isn't answered, reach the user another way.",
+        "status. It doesn't ring in the user's quiet hours. When it isn't answered, reach the user another way.",
         {
             "reason": {"type": "string", "maxLength": MAX_REASON,
                        "description": "Why you call, in one or two sentences. Hermes opens the call with it."},
