@@ -269,3 +269,33 @@ def test_pushed_envelope_opens_on_the_phone(tmp_path):
     assert json.loads(opened)["text"] == "hi ✓"
     assert len(body) <= push.MAX_BODY
     assert len(push.envelope_for(device, push.message("bot_message", text=push.clip("é" * 5000)), sig)) <= push.MAX_BODY
+
+
+def test_a_ring_carries_the_call_and_fits_one_push(tmp_path):
+    from herald_push import plugin
+    store = Store(tmp_path)
+    data, enc = phone()
+    device = Device.parse(data)
+    _, _, sig = store.identity()
+    request = {"id": "f" * 32, "tool": "phone_call_me", "session": "20261018_abc", "expires": 1_800_000_075,
+               "args": {"reason": "日本" * 150, "details": "😀" * 2000}}
+    message = plugin.wake_message(request)
+    assert message["type"] == "phone_call" and message["request_id"] == "f" * 32
+    assert message["session"] == "20261018_abc" and message["expires"] == 1_800_000_075
+    assert len(message["reason"].encode()) <= plugin.MAX_REASON_BYTES
+    assert len(message["details"].encode()) <= plugin.MAX_DETAILS_BYTES
+    body = push.envelope_for(device, message, sig)
+    assert len(body) <= push.MAX_BODY
+    opened = json.loads(crypto.open_envelope(crypto.Envelope.from_json(body), device.push_topic, crypto.G2P, enc,
+                                             crypto.decode_public(store.public_identity()["sig_pub"])))
+    assert opened["reason"].startswith("日本") and opened["details"].endswith("…")
+    # JSON escaping doubles quotes and backslashes past the byte caps: the details give way, then the reason.
+    escaped = plugin.wake_message(dict(request, args={"reason": '"' * 1000, "details": "\\" * 3000}))
+    body = push.envelope_for(device, escaped, sig)
+    assert len(body) <= push.MAX_BODY
+    opened = json.loads(crypto.open_envelope(crypto.Envelope.from_json(body), device.push_topic, crypto.G2P, enc,
+                                             crypto.decode_public(store.public_identity()["sig_pub"])))
+    assert opened["reason"].startswith('"') and opened["request_id"] == "f" * 32
+    # Any other tool is only a nudge: the call is fetched over the socket.
+    other = plugin.wake_message({"id": "e" * 32, "tool": "phone_location", "args": {"fresh": True}})
+    assert other["type"] == "phone_request" and "args" not in other and "reason" not in other

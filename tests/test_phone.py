@@ -454,4 +454,75 @@ def test_every_schema_is_a_closed_object():
     for name, (schema, timeout, _) in phone.TOOLS.items():
         assert schema["name"] == name and name.startswith("phone_")
         assert schema["parameters"]["additionalProperties"] is False
-        assert timeout in (phone.READ_TIMEOUT, phone.CONFIRM_TIMEOUT)
+        assert timeout in (phone.READ_TIMEOUT, phone.CONFIRM_TIMEOUT, phone.CALL_TIMEOUT)
+
+
+def test_a_call_takes_no_number_only_a_reason():
+    schema = phone.TOOLS[phone.CALL_TOOL][0]["parameters"]
+    assert set(schema["properties"]) == {"reason", "details"} and schema["required"] == ["reason"]
+
+
+@pytest.mark.parametrize("status", ["answered", "declined", "no_answer", "busy"])
+def test_a_call_returns_how_it_ended_with_what_to_do_next(tmp_path, ctx, status):
+    phones = Phones(Store(tmp_path))
+    phone.register_tools(ctx, phones)
+    phones.report(PHONE, KEY, "Pixel", [phone.CALL_TOOL])
+    seen = {}
+
+    def ring():
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            waiting = phones.pending(PHONE)
+            if waiting:
+                seen["args"] = waiting[0]["args"]
+                phones.answer(PHONE, waiting[0]["id"], {"status": status}, None)
+                return
+            time.sleep(0.02)
+    threading.Thread(target=ring, daemon=True).start()
+    out = json.loads(ctx.tools[phone.CALL_TOOL][0]({"reason": "  The deploy failed.  ", "details": " Build 42 "}))
+    assert out == {"status": status, "note": phone.CALL_NOTES[status]}
+    assert seen["args"] == {"reason": "The deploy failed.", "details": "Build 42"}
+    if status != "answered":
+        assert "another way" in out["note"] or "message" in out["note"]
+
+
+def test_a_call_without_a_reason_doesnt_ring(tmp_path, ctx):
+    phones = Phones(Store(tmp_path))
+    phone.register_tools(ctx, phones)
+    phones.report(PHONE, KEY, "Pixel", [phone.CALL_TOOL])
+    assert "reason" in json.loads(ctx.tools[phone.CALL_TOOL][0]({"reason": "  "}))["error"]
+    assert phones.pending(PHONE) == []
+
+
+def test_a_call_that_doesnt_get_through_says_so(tmp_path, ctx, monkeypatch):
+    monkeypatch.setitem(phone.TOOLS, phone.CALL_TOOL, (phone.TOOLS[phone.CALL_TOOL][0], 0.3, "📞"))
+    phones = Phones(Store(tmp_path))
+    phone.register_tools(ctx, phones)
+    phones.report(PHONE, KEY, "Pixel", [phone.CALL_TOOL])
+    out = json.loads(ctx.tools[phone.CALL_TOOL][0]({"reason": "Wake up"}))
+    assert out["status"] == "unreachable" and out["note"] == phone.UNREACHABLE_NOTE and "didn't answer" in out["error"]
+    # A phone that sends anything but a known status hasn't rung either.
+    assert json.loads(phone.call_result(json.dumps({"status": "maybe"})))["status"] == "unreachable"
+
+
+def test_a_call_from_a_messaging_platform_is_refused(tmp_path, ctx, monkeypatch):
+    monkeypatch.setattr(phone, "on_messaging_platform", lambda: True)
+    phones = Phones(Store(tmp_path))
+    phone.register_tools(ctx, phones)
+    phones.report(PHONE, KEY, "Pixel", [phone.CALL_TOOL])
+    assert "messaging platform" in json.loads(ctx.tools[phone.CALL_TOOL][0]({"reason": "Hi"}))["error"]
+    assert phones.pending(PHONE) == []
+
+
+def test_a_call_wakes_the_phone_with_the_whole_request(tmp_path):
+    woken = []
+    phones = Phones(Store(tmp_path), wake=lambda d, r: woken.append((d, r)))
+    phones.report(PHONE, KEY, "Pixel", [phone.CALL_TOOL], push_id=OTHER)
+    answer_when_asked(phones, PHONE, result={"status": "declined"})
+    phones.call(phone.CALL_TOOL, {"reason": "Check-in closes"}, "s1")
+    deadline = time.time() + 2
+    while not woken and time.time() < deadline:
+        time.sleep(0.02)
+    push_id, request = woken[0]
+    assert push_id == OTHER and request["tool"] == phone.CALL_TOOL and request["args"] == {"reason": "Check-in closes"}
+    assert request["session"] == "s1" and request["expires"] > request["created"]

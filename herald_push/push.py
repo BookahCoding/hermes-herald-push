@@ -39,20 +39,33 @@ def clip(text: str) -> str:
     return cut.rstrip() + "…"
 
 
+def clip_bytes(text: str, limit: int) -> str:
+    """[text] cut to at most [limit] bytes of UTF-8, at a character's end."""
+    text = text.strip()
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    cut = text.encode("utf-8")[: max(0, limit - 3)].decode("utf-8", "ignore")
+    return cut.rstrip() + "…"
+
+
+SHRINKABLE = ("text", "details", "reason")
+
+
 def envelope_for(device: Device, payload: dict, sig_key) -> str:
-    """The sealed message, its text cut further while it's over ntfy's limit: JSON escaping can still grow a
-    clipped text past it (control characters, many short lines). The phone can read the rest over the socket."""
-    text = payload.get("text")
+    """The sealed message, its text (or a call's details, then its reason) cut further while it's over ntfy's
+    limit: JSON escaping can still grow a clipped text past it (quotes, backslashes, control characters, many
+    short lines). The phone can read the rest over the socket."""
     while True:
         plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         env = crypto.seal(plaintext, device.push_topic, crypto.G2P, crypto.decode_public(device.enc_pub), sig_key)
         body = env.to_json()
         if len(body.encode("utf-8")) <= MAX_BODY:
             return body
-        if not isinstance(text, str) or len(text) <= 1:
+        field = next((k for k in SHRINKABLE if isinstance(payload.get(k), str) and len(payload[k]) > 1), None)
+        if field is None:
             raise ValueError("push message too large")
-        text = text[: len(text) * 3 // 4 - 1].rstrip() + "…"
-        payload = dict(payload, text=text)
+        value = payload[field]
+        payload = dict(payload, **{field: value[: len(value) * 3 // 4 - 1].rstrip() + "…"})
 
 
 def publish(device: Device, payload: dict, sig_key, client: Optional[httpx.Client] = None) -> bool:
