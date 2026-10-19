@@ -77,7 +77,12 @@ CALL_NOTES = {
                  "message or a reminder.",
     "busy": "The user is already on a call with Hermes, so it didn't ring. If it still matters, send a message "
             "instead.",
+    "quiet": "The user set quiet hours on their phone, so it didn't ring, and another call won't ring before they "
+             "end. Reach them another way now: send a message, or set a reminder for after quiet hours. Only if it "
+             "truly can't wait, start your message by saying it's urgent.",
 }
+# How the phone gives the end of quiet hours: "07:00".
+_CLOCK = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 UNREACHABLE_NOTE = ("The call didn't get through to the user's phone. If it still matters, reach them another way "
                     "now, for example a message or a reminder.")
 
@@ -214,7 +219,7 @@ TOOLS: Dict[str, tuple] = {
         "important or urgent enough to interrupt them (an alert, a reminder that must not be missed, a decision "
         "that can't wait), or when the user asked to be called, also from a scheduled job (\"call me at 7:30\"). "
         "Waits until the call is answered, declined or not answered (about 45 seconds of ringing) and returns that "
-        "status. When it isn't answered, reach the user another way.",
+        "status. It doesn't ring in the user's quiet hours. When it isn't answered, reach the user another way.",
         {
             "reason": {"type": "string", "maxLength": MAX_REASON,
                        "description": "Why you call, in one or two sentences. Hermes opens the call with it."},
@@ -233,7 +238,12 @@ def call_result(raw: str) -> str:
         data = None
     status = data.get("status") if isinstance(data, dict) else None
     if status in CALL_NOTES:
-        return json.dumps({"status": status, "note": CALL_NOTES[status]})
+        out = {"status": status, "note": CALL_NOTES[status]}
+        until = data.get("until")
+        if status == "quiet" and isinstance(until, str) and _CLOCK.fullmatch(until):
+            out["until"] = until
+            out["note"] += f" Quiet hours end at {until}, the phone's local time."
+        return json.dumps(out)
     error = data.get("error") if isinstance(data, dict) else None
     out = {"status": "unreachable", "note": UNREACHABLE_NOTE}
     if isinstance(error, str):

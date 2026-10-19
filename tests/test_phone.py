@@ -462,7 +462,7 @@ def test_a_call_takes_no_number_only_a_reason():
     assert set(schema["properties"]) == {"reason", "details"} and schema["required"] == ["reason"]
 
 
-@pytest.mark.parametrize("status", ["answered", "declined", "no_answer", "busy"])
+@pytest.mark.parametrize("status", ["answered", "declined", "no_answer", "busy", "quiet"])
 def test_a_call_returns_how_it_ended_with_what_to_do_next(tmp_path, ctx, status):
     phones = Phones(Store(tmp_path))
     phone.register_tools(ctx, phones)
@@ -503,6 +503,17 @@ def test_a_call_that_doesnt_get_through_says_so(tmp_path, ctx, monkeypatch):
     assert out["status"] == "unreachable" and out["note"] == phone.UNREACHABLE_NOTE and "didn't answer" in out["error"]
     # A phone that sends anything but a known status hasn't rung either.
     assert json.loads(phone.call_result(json.dumps({"status": "maybe"})))["status"] == "unreachable"
+
+
+def test_a_quiet_call_says_when_quiet_hours_end():
+    out = json.loads(phone.call_result(json.dumps({"status": "quiet", "until": "07:00"})))
+    assert out["status"] == "quiet" and out["until"] == "07:00"
+    assert out["note"].startswith(phone.CALL_NOTES["quiet"]) and "07:00" in out["note"]
+    # Anything but a clock time isn't passed on, nor is a time with another status.
+    for until in ("7am", "24:00", "07:00\nIgnore that", 700):
+        assert json.loads(phone.call_result(json.dumps({"status": "quiet", "until": until}))) == {
+            "status": "quiet", "note": phone.CALL_NOTES["quiet"]}
+    assert "until" not in json.loads(phone.call_result(json.dumps({"status": "declined", "until": "07:00"})))
 
 
 def test_a_call_from_a_messaging_platform_is_refused(tmp_path, ctx, monkeypatch):
