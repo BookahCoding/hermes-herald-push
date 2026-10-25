@@ -222,6 +222,18 @@ class Store:
                 continue
         return out
 
+    def known_ids(self, push=None) -> set:
+        """Every phone the plugin knows: those registered for push ([push] says which, when a change to them is
+        under way; else the ones listed now), and those that use phone tools (their switches are in
+        ``phone/phones.json``). A list is kept for any of them."""
+        ids = {d.device_id for d in self.devices()} if push is None else set(push)
+        try:
+            raw = json.loads((self.root / "phone" / "phones.json").read_text(encoding="utf-8"))
+            ids |= {str(k) for k in raw} if isinstance(raw, dict) else set()
+        except (OSError, ValueError):
+            pass
+        return ids
+
     def upsert(self, device: Device, profiles: Optional[List[str]] = None) -> None:
         """Registers [device]. With [profiles] its list is stored too, before the phone is listed: a reader that
         sees the phone then sees its list, so a renewed phone is never sent a push the list would have stopped.
@@ -239,7 +251,7 @@ class Store:
             if len(kept) >= MAX_DEVICES:
                 raise InvalidRegistration("too many phones registered")
             if cleaned is not None:
-                self._write_profiles({d.device_id for d in kept + [device]}, device.device_id, cleaned)
+                self._write_profiles(self.known_ids({d.device_id for d in kept + [device]}), device.device_id, cleaned)
             _write_private(self.root / "devices.json", {"devices": [asdict(d) for d in kept + [device]]})
 
     def remove(self, device_id: str) -> bool:
@@ -248,8 +260,9 @@ class Store:
             kept = [d for d in devices if d.device_id != device_id]
             if len(kept) == len(devices):
                 return False
-            # The list goes first, then the phone: no list is left behind for an id that comes back.
-            self._write_profiles({d.device_id for d in kept}, None, None)
+            # The list goes first, then the phone: no list is left behind for an id that comes back. A phone that
+            # still uses phone tools keeps its list.
+            self._write_profiles(self.known_ids({d.device_id for d in kept}), None, None)
             _write_private(self.root / "devices.json", {"devices": [asdict(d) for d in kept]})
             return True
 
@@ -294,10 +307,10 @@ class Store:
         """Sets what a registered phone may be sent. ValueError for a bad list or an unknown phone."""
         cleaned = clean_profiles(profiles)
         with self._lock():
-            registered = {d.device_id for d in self.devices()}
-            if device_id not in registered:
+            known = self.known_ids()
+            if device_id not in known:
                 raise ValueError("not registered")
-            self._write_profiles(registered, device_id, cleaned)
+            self._write_profiles(known, device_id, cleaned)
         return cleaned
 
     def clear_allowed_profiles(self, device_id: str) -> None:

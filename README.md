@@ -49,6 +49,13 @@ that isn't on it, whether the plugin has never seen it or it was made after the 
   `profiles` (a list of names), `test` takes a `profile` and sends one synthetic message through the same check as
   a real push. `info` and `register` answer with `features: ["profile_allowlist"]`, which Herald checks for.
 - **If the lists can't be read** the plugin falls back to `default` only for every phone, never to everything.
+- **Phone tools follow the same list.** A call is routed only to a phone that takes calls from the profile whose
+  agent makes it, so a profile that isn't on a phone's list can neither ring that phone (`phone_call_me`) nor read
+  it, and is not even offered the tools when no phone takes its calls. The phone that sent the message still
+  decides alone: it is never replaced by another one. A phone's list is the one it reported with `phone tools`
+  (`profiles` in the JSON), else the list of the push registration it is linked to, else none (every profile). A
+  profile that can't be told counts as not on a list. The request and the push for it name the profile (`bot`), so
+  the phone can check it too.
 - **Every copy must be 0.6.0.** A profile with its own older copy of this plugin does not know about the lists.
 
 ## Cron runs (0.4.0)

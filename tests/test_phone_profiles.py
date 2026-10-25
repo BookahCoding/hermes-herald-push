@@ -1,0 +1,351 @@
+"""Phone tools and profiles: an agent in a profile a phone doesn't take calls from can neither ring it nor read it.
+
+Synthetic phones and profiles only.
+"""
+
+import json
+import sys
+import time
+import types
+
+import pytest
+
+from herald_push import commands, crypto, phone, plugin
+from herald_push.phone import Phones
+from herald_push.store import Device, Store
+
+MINE = "0b6f2c1e-1111-4222-8333-944445555666"
+SPARE = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+KEY = "a" * 64
+SPARE_KEY = "b" * 64
+
+
+def push_phone(device_id):
+    enc, sig = crypto.generate_key(), crypto.generate_key()
+    return Device.parse({
+        "device_id": device_id, "name": "Pixel", "server": "https://ntfy.sh", "push_topic": crypto.new_topic(),
+        "reply_topic": crypto.new_topic(), "enc_pub": crypto.encode_public(enc.public_key()),
+        "sig_pub": crypto.encode_public(sig.public_key()),
+    })
+
+
+def limited(tmp_path, tools=("phone_battery", phone.CALL_TOOL), profiles=("default",)):
+    """A phone that takes calls from [profiles] only."""
+    phones = Phones(Store(tmp_path))
+    phones.report(MINE, KEY, "Pixel", list(tools), profiles=list(profiles))
+    return phones
+
+
+class FakeCtx:
+    def __init__(self):
+        self.tools = {}
+        self.unloads = []
+
+    def register_tool(self, name, toolset, schema, handler, check_fn=None, emoji=""):
+        self.tools[name] = (handler, check_fn)
+
+    def on_unload(self, callback):
+        self.unloads.append(callback)
+
+
+@pytest.fixture
+def ctx():
+    ctx = FakeCtx()
+    yield ctx
+    for stop in ctx.unloads:
+        stop()
+
+
+
+def eager_phone(phones, result):
+    """A phone that answers whatever is asked of it as soon as it is asked: a call that wrongly gets through is
+    answered, not left to time out, so it shows up in the result."""
+    import threading
+    stop = threading.Event()
+
+    def run():
+        while not stop.is_set():
+            for request in phones.pending(MINE):
+                phones.answer(MINE, request["id"], result, None)
+            time.sleep(0.01)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return stop
+
+# ── routing ──────────────────────────────────────────────────────────────────
+
+def test_a_phone_with_a_list_takes_calls_only_from_its_profiles(tmp_path):
+    phones = limited(tmp_path)
+    assert phones.route("phone_battery", profile="default") == (MINE, None)
+    device, refusal = phones.route("phone_battery", profile="froebel")
+    assert device is None and "doesn't" in refusal or "No phone takes calls" in refusal
+    # A profile made later, and one that can't be told, are not on the list either.
+    assert phones.route("phone_battery", profile="made-later")[0] is None
+    assert phones.route("phone_battery", profile="")[0] is None
+
+
+def test_a_phone_with_no_list_takes_every_profile_as_before(tmp_path):
+    phones = Phones(Store(tmp_path))
+    phones.report(MINE, KEY, "Pixel", ["phone_battery"])
+    for profile in ("default", "froebel", "", None):
+        assert phones.route("phone_battery", profile=profile)[0] == MINE
+
+
+def test_the_phone_that_sent_the_message_decides_alone_and_isnt_replaced_by_another(tmp_path):
+    phones = limited(tmp_path)
+    phones.report(SPARE, SPARE_KEY, "Spare", ["phone_battery"])  # no list: takes everything
+    phones.here(MINE, "sid-mine")
+    # A turn that came from my phone, in a profile it doesn't take calls from: refused, not sent to the spare.
+    device, refusal = phones.route("phone_battery", "sid-mine", "froebel")
+    assert device is None and "doesn't take calls from this profile" in refusal
+    assert phones.route("phone_battery", "sid-mine", "default")[0] == MINE
+
+
+def test_a_turn_no_phone_sent_goes_only_to_a_phone_that_takes_its_profile(tmp_path):
+    phones = limited(tmp_path)
+    phones.report(SPARE, SPARE_KEY, "Spare", ["phone_battery"], profiles=["default", "froebel"])
+    assert phones.route("phone_battery", profile="froebel")[0] == SPARE
+    assert phones.route("phone_battery", profile="default")[0] in (MINE, SPARE)
+    only_mine = limited(tmp_path / "x")
+    assert only_mine.route("phone_battery", profile="froebel")[0] is None
+
+
+def test_a_profile_that_no_phone_takes_isnt_offered_the_tool_at_all(tmp_path):
+    phones = limited(tmp_path)
+    assert phones.offered("phone_battery", "default")
+    assert not phones.offered("phone_battery", "froebel")
+    # Unknown at the time of asking: offered as before; the call itself is still checked.
+    assert phones.offered("phone_battery", None)
+    assert phones.offered("phone_battery")
+
+
+# ── calls ────────────────────────────────────────────────────────────────────
+
+def test_a_refused_call_writes_no_request_and_sends_no_push(tmp_path):
+    woken = []
+    store = Store(tmp_path)
+    phones = Phones(store, wake=lambda d, r: woken.append(r))
+    phones.report(MINE, KEY, "Pixel", [phone.CALL_TOOL], push_id=SPARE, profiles=["default"])
+    answer = json.loads(phones.call(phone.CALL_TOOL, {"reason": "urgent"}, "s1", profile="froebel"))
+    assert "error" in answer
+    assert phones.pending(MINE) == [] and not list((tmp_path / "phone").glob("*.req.json"))
+    time.sleep(0.1)
+    assert woken == []
+
+
+def test_an_allowed_call_names_its_profile_to_the_phone_and_in_the_push(tmp_path):
+    woken = []
+    phones = Phones(Store(tmp_path), wake=lambda d, r: woken.append(r))
+    phones.report(MINE, KEY, "Pixel", [phone.CALL_TOOL], push_id=SPARE, profiles=["default", "alice"])
+
+    def answer():
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            waiting = phones.pending(MINE)
+            if waiting:
+                assert waiting[0]["profile"] == "alice"
+                phones.answer(MINE, waiting[0]["id"], {"status": "answered"}, None)
+                return
+            time.sleep(0.02)
+
+    import threading
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    phones.call(phone.CALL_TOOL, {"reason": "check-in"}, "s1", profile="alice")
+    thread.join()
+    deadline = time.time() + 2
+    while not woken and time.time() < deadline:
+        time.sleep(0.02)
+    assert woken[0]["profile"] == "alice"
+    message = plugin.wake_message(woken[0])
+    assert message["type"] == "phone_call" and message["bot"] == "alice"
+    assert plugin.wake_message({**woken[0], "tool": "phone_battery"})["bot"] == "alice"
+
+
+def test_a_call_with_no_profile_in_the_request_pushes_no_bot_field(tmp_path):
+    message = plugin.wake_message({"id": "r1", "tool": "phone_battery"})
+    assert "bot" not in message
+
+
+# ── the handler: which profile is calling ────────────────────────────────────
+
+def test_the_handler_passes_the_calling_profile_and_a_froebel_call_is_refused(tmp_path, ctx, monkeypatch):
+    monkeypatch.setattr(phone, "turn_profile", lambda: "froebel")
+    phones = limited(tmp_path)
+    phone.register_tools(ctx, phones)
+    handler, check = ctx.tools["phone_battery"]
+    assert check() is False  # not offered to that agent at all
+    stop = eager_phone(phones, {"level": 80})
+    try:
+        started = time.time()
+        result = json.loads(handler({}))
+    finally:
+        stop.set()
+    # Refused at once, with the reason, and the phone was never asked: it would have answered.
+    assert "level" not in result and "profile" in result["error"]
+    assert time.time() - started < 2
+
+
+def test_a_call_me_from_froebel_does_not_ring_and_says_to_reach_the_user_another_way(tmp_path, ctx, monkeypatch):
+    monkeypatch.setattr(phone, "turn_profile", lambda: "froebel")
+    phones = limited(tmp_path)
+    phone.register_tools(ctx, phones)
+    stop = eager_phone(phones, {"status": "answered"})
+    try:
+        started = time.time()
+        result = json.loads(ctx.tools[phone.CALL_TOOL][0]({"reason": "Hello"}))
+    finally:
+        stop.set()
+    # The phone would have answered; the call never reached it.
+    assert result.get("status") != "answered"
+    assert time.time() - started < 2
+
+
+def test_the_default_profiles_agent_still_reaches_the_phone(tmp_path, ctx, monkeypatch):
+    monkeypatch.setattr(phone, "turn_profile", lambda: "default")
+    phones = limited(tmp_path)
+    phone.register_tools(ctx, phones)
+    handler, check = ctx.tools["phone_battery"]
+    assert check() is True
+
+    import threading
+
+    def answer():
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            waiting = phones.pending(MINE)
+            if waiting:
+                phones.answer(MINE, waiting[0]["id"], {"level": 80}, None)
+                return
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    assert json.loads(handler({})) == {"level": 80}
+    thread.join()
+
+
+def fake_modules(monkeypatch, home=None, home_name=None, env=None, raises=False):
+    """Stand-ins for Hermes' own modules, so the profile is read the way it is on a gateway."""
+    constants = types.ModuleType("hermes_constants")
+    constants.get_hermes_home = lambda: home
+    constants.profile_name_for_home = lambda path: home_name
+    session = types.ModuleType("gateway.session_context")
+
+    def get_session_env(name, default=""):
+        if raises:
+            raise RuntimeError("no context")
+        return (env or {}).get(name, default)
+
+    session.get_session_env = get_session_env
+    monkeypatch.setitem(sys.modules, "hermes_constants", constants)
+    monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session)
+
+
+def test_the_profile_is_read_from_the_home_the_call_runs_in(monkeypatch):
+    fake_modules(monkeypatch, home="/h/profiles/froebel", home_name="froebel", env={"HERMES_SESSION_PROFILE": "default"})
+    assert phone.turn_profile() == "froebel"  # the home is authoritative over the session's own word
+
+
+def test_the_profile_falls_back_to_the_session_and_then_to_unknown(monkeypatch):
+    fake_modules(monkeypatch, home=None, home_name=None, env={"HERMES_SESSION_PROFILE": "alice"})
+    assert phone.turn_profile() == "alice"
+    fake_modules(monkeypatch, home=None, home_name=None, env={})
+    assert phone.turn_profile() == ""
+    fake_modules(monkeypatch, home=None, home_name=None, raises=True)
+    assert phone.turn_profile() == ""
+    # A name that isn't a profile name is not trusted.
+    fake_modules(monkeypatch, home="x", home_name="../evil", env={"HERMES_SESSION_PROFILE": "bad name"})
+    assert phone.turn_profile() == ""
+
+
+# ── the list for a phone that only uses phone tools ──────────────────────────
+
+def test_a_phone_with_only_phone_tools_has_its_list_without_a_push_registration(tmp_path):
+    store = Store(tmp_path)
+    phones = Phones(store)
+    phones.report(MINE, KEY, "Pixel", ["phone_battery"], profiles=["default"])
+    assert store.devices() == []
+    assert store.allowed_profiles(MINE) == ["default"]
+    assert phones.route("phone_battery", profile="froebel")[0] is None
+
+
+def test_the_list_is_stored_before_the_phone_is_listed(tmp_path, monkeypatch):
+    from herald_push import store as store_module
+    written = []
+    real = store_module._write_private
+    spy = lambda path, data: (written.append(path.name), real(path, data))[1]  # noqa: E731
+    # Each module holds its own reference to the writer.
+    monkeypatch.setattr(store_module, "_write_private", spy)
+    monkeypatch.setattr(phone, "_write_private", spy)
+    Phones(Store(tmp_path)).report(MINE, KEY, "Pixel", ["phone_battery"], profiles=["default"])
+    assert written.index("profiles.json") < written.index("phones.json")
+
+
+def test_a_bad_list_in_a_phone_report_changes_nothing(tmp_path):
+    phones = Phones(Store(tmp_path))
+    with pytest.raises(ValueError):
+        phones.report(MINE, KEY, "Pixel", ["phone_battery"], profiles=["../etc"])
+    assert phones._phones() == {} and phones.store.allowed_profiles(MINE) is None
+
+
+def test_a_report_without_a_list_leaves_the_phones_list_alone(tmp_path):
+    phones = limited(tmp_path)
+    phones.report(MINE, KEY, "Pixel", ["phone_battery"])  # an older app
+    assert phones.store.allowed_profiles(MINE) == ["default"]
+
+
+def test_unregistering_push_keeps_the_list_of_a_phone_still_using_phone_tools(tmp_path):
+    store = Store(tmp_path)
+    store.upsert(push_phone(MINE), ["default"])
+    Phones(store).report(MINE, KEY, "Pixel", ["phone_battery"])
+    assert store.remove(MINE)
+    assert store.allowed_profiles(MINE) == ["default"]
+    # Once phone tools forget the phone too, nothing knows it any more and its list goes.
+    Phones(store).remove(MINE)
+    assert store.allowed_profiles(MINE) is None
+
+
+def test_the_commands_set_and_read_a_phone_tool_phones_list(tmp_path):
+    store = Store(tmp_path)
+    phones = Phones(store)
+    handle = commands.make_handler(store, "t", lambda: True, trusted=lambda: True, phones=phones)
+    body = {"device_id": MINE, "key": KEY, "name": "Pixel", "tools": ["phone_battery"], "profiles": ["default"]}
+    assert json.loads(handle("phone tools " + json.dumps(body)))["ok"] is True
+    assert json.loads(handle("profiles get " + json.dumps({"device_id": MINE})))["profiles"] == ["default"]
+    assert json.loads(handle("profiles set " + json.dumps({"device_id": MINE, "profiles": ["default", "alice"]})))["profiles"] == ["alice", "default"]
+    # Not a push phone: a synthetic push has nowhere to go.
+    assert json.loads(handle("profiles test " + json.dumps({"device_id": MINE, "profile": "default"})))["ok"] is False
+    bad = json.loads(handle("phone tools " + json.dumps({**body, "profiles": "default"})))
+    assert bad["ok"] is False
+
+
+def test_the_version_in_the_manifest_still_matches(tmp_path):
+    import re
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    assert re.search(r"^version: (\S+)", (root / "plugin.yaml").read_text(encoding="utf-8"), re.M).group(1) == plugin.VERSION
+
+
+def test_a_phone_with_no_list_of_its_own_uses_the_one_of_the_push_registration_it_is_linked_to(tmp_path):
+    store = Store(tmp_path)
+    store.upsert(push_phone(SPARE), ["default"])
+    phones = Phones(store)
+    # Reported by an app that sent no list, but linked to the push registration that has one.
+    phones.report(MINE, KEY, "Pixel", ["phone_battery"], push_id=SPARE)
+    assert phones.route("phone_battery", profile="froebel")[0] is None
+    assert phones.route("phone_battery", profile="default")[0] == MINE
+    assert not phones.offered("phone_battery", "froebel") and phones.offered("phone_battery", "default")
+    # Its own list wins over the linked one.
+    phones.report(MINE, KEY, "Pixel", ["phone_battery"], push_id=SPARE, profiles=["default", "froebel"])
+    assert phones.route("phone_battery", profile="froebel")[0] == MINE
+
+
+def test_a_phone_linked_to_a_push_registration_without_a_list_takes_every_profile(tmp_path):
+    store = Store(tmp_path)
+    store.upsert(push_phone(SPARE))
+    phones = Phones(store)
+    phones.report(MINE, KEY, "Pixel", ["phone_battery"], push_id=SPARE)
+    assert phones.route("phone_battery", profile="froebel")[0] == MINE

@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from .store import DEVICE_ID_RE, Store, _write_private
+from .store import DEVICE_ID_RE, PROFILE_RE, Store, _write_private, clean_profiles
 
 log = logging.getLogger(__name__)
 
@@ -293,7 +293,8 @@ class Phones:
         known = self._phones().get(device_id, {}).get("key")
         return isinstance(known, str) and hmac.compare_digest(known, self._hash(key))
 
-    def report(self, device_id: str, key: str, name: str, tools: List[str], push_id: Optional[str] = None) -> List[str]:
+    def report(self, device_id: str, key: str, name: str, tools: List[str], push_id: Optional[str] = None,
+               profiles: Optional[List[str]] = None) -> List[str]:
         """Records what [device_id] has switched on (only tools this plugin knows); returns those. The first
         report binds the phone id to [key]; a later one with another key is refused. [push_id] is the phone's
         push registration, if any, which a call nudges. Only a ring ([CALL_TOOL]) travels in the push itself, so
@@ -304,6 +305,8 @@ class Phones:
             raise ValueError("bad key")
         if push_id is not None and not DEVICE_ID_RE.match(push_id):
             raise ValueError("bad push_id")
+        # [profiles]: the profiles whose agents may call this phone. Checked before anything is written.
+        cleaned_profiles = None if profiles is None else clean_profiles(profiles)
         kept = sorted({t for t in tools if isinstance(t, str) and t in TOOLS})
         clean = "".join(ch for ch in str(name or "") if ch.isprintable())[:MAX_NAME].strip() or "Phone"
         with self.store._lock():
@@ -313,6 +316,10 @@ class Phones:
                 raise ValueError("this phone id is held by another key")
             # Kept with no tools too: the key stays bound to the id.
             entry = {"name": clean, "tools": kept, "seen": int(self.clock()), "key": self._hash(key), "push": push_id}
+            # The list is stored before the phone is listed, so no call can reach a new phone ahead of it. Written here,
+            # under the lock this already holds (the lock can't be taken twice).
+            if cleaned_profiles is not None:
+                self.store._write_profiles(self.store.known_ids() | {device_id}, device_id, cleaned_profiles)
             rank = phones.get(device_id, {}).get("rank")
             if isinstance(rank, int):
                 entry["rank"] = rank
@@ -388,6 +395,8 @@ class Phones:
                 return False
             del phones[device_id]
             _write_private(self.root / "phones.json", phones)
+            # Its list goes with it, unless the phone is still registered for push.
+            self.store._write_profiles(self.store.known_ids(), None, None)
             here = self._here()
             sids = {k: v for k, v in here["sids"].items() if isinstance(v, dict) and v.get("device") != device_id}
             used = {k: v for k, v in here["used"].items() if k != device_id}
@@ -397,13 +406,20 @@ class Phones:
             self.answer(device_id, request["id"], None, "The user removed that phone.")
         return True
 
-    def route(self, tool: str, sid: str = "") -> tuple:
+    def route(self, tool: str, sid: str = "", profile: Optional[str] = None) -> tuple:
         """``(phone, refusal)`` for a call of [tool] from a turn on chat connection [sid]:
         the phone that sent that turn's message; else a phone that sent a turn in the last two minutes; else the
         first phone in the user's order that has the tool on.
-        The phone that sent the message decides alone: with the tool off there, no other phone is asked."""
+        The phone that sent the message decides alone: with the tool off there, no other phone is asked.
+        [profile] is the profile whose agent calls ("" when it can't be told; None skips the check, for callers that
+        have none). A phone with a list takes calls only from the profiles on it, so an agent in a profile that isn't
+        one of them can neither read nor ring that phone; a phone with no list takes them all, as before."""
         now = self.clock()
         phones = {k: v for k, v in self._phones().items() if now - int(v.get("seen", 0)) < STALE_SECONDS}
+        allow = self.store.allowlist() if profile is not None else None
+
+        def takes(device_id: Optional[str]) -> bool:
+            return self._takes(allow, phones.get(device_id or ""), device_id or "", profile)
 
         def offers(device_id: Optional[str]) -> bool:
             return device_id in phones and tool in (phones[device_id].get("tools") or [])
@@ -411,37 +427,60 @@ class Phones:
         here = self._here()
         sender = (here["sids"].get(sid) or {}).get("device") if sid else None
         if sender in phones:
+            if not takes(sender):
+                return None, f"The phone this message came from ({phones[sender].get('name') or 'Phone'}) doesn't take calls from this profile."
             if offers(sender):
                 return sender, None
             return None, f"The phone this message came from ({phones[sender].get('name') or 'Phone'}) has this tool off."
-        offering = [(int(here["used"].get(k, 0)), int(v.get("seen", 0)), k) for k, v in phones.items() if offers(k)]
+        offering = [(int(here["used"].get(k, 0)), int(v.get("seen", 0)), k) for k, v in phones.items() if offers(k) and takes(k)]
         # A side question or background task (/btw, /bg) runs without its chat connection: the phone that sent
         # a turn moments ago is the one that asked.
         latest = max(offering) if offering else None
         if latest is not None and now - latest[0] < JUST_SENT_SECONDS:
             return latest[2], None
-        first = next((k for k in self._ordered(phones, here["used"]) if offers(k)), None)
-        return (first, None) if first else (None, "No phone offers this tool any more.")
+        first = next((k for k in self._ordered(phones, here["used"]) if offers(k) and takes(k)), None)
+        if first:
+            return first, None
+        if allow is not None and any(offers(k) for k in phones):
+            return None, "No phone takes calls from this profile."
+        return None, "No phone offers this tool any more."
 
-    def phone_for(self, tool: str, sid: str = "") -> Optional[str]:
+    @staticmethod
+    def _takes(allow, phone: Optional[dict], device_id: str, profile: Optional[str]) -> bool:
+        """Whether [device_id] takes calls from [profile]. A phone's own list decides; a phone that reported none
+        (before its app has) uses the list of the push registration it is linked to; a phone with neither takes
+        every profile, as before lists existed."""
+        if allow is None:
+            return True
+        lst = allow.get(device_id)
+        if lst is None:
+            push = (phone or {}).get("push")
+            lst = allow.get(push) if isinstance(push, str) else None
+        return True if lst is None else (profile or "") in lst
+
+    def phone_for(self, tool: str, sid: str = "", profile: Optional[str] = None) -> Optional[str]:
         """The phone a call of [tool] from chat connection [sid] goes to, or None."""
-        return self.route(tool, sid)[0]
+        return self.route(tool, sid, profile)[0]
 
-    def offered(self, tool: str) -> bool:
-        """Whether any phone has [tool] on: what the agent is offered."""
+    def offered(self, tool: str, profile: Optional[str] = None) -> bool:
+        """Whether any phone has [tool] on, and takes calls from [profile] when that is known: what the agent is
+        offered. An agent whose profile no phone takes calls from isn't offered the tool at all."""
         now = self.clock()
+        allow = self.store.allowlist() if profile else None
         return any(tool in (v.get("tools") or []) and now - int(v.get("seen", 0)) < STALE_SECONDS
-                   for v in self._phones().values())
+                   and self._takes(allow, v, k, profile)
+                   for k, v in self._phones().items())
 
     # ── requests ────────────────────────────────────────────────────────────
 
     def _path(self, request_id: str, kind: str) -> Path:
         return self.root / f"{request_id}.{kind}.json"
 
-    def call(self, tool: str, args: dict, session_id: str = "", sid: str = "") -> str:
+    def call(self, tool: str, args: dict, session_id: str = "", sid: str = "", profile: Optional[str] = None) -> str:
         """Runs [tool] on a phone and waits for its answer: the tool result the agent reads, as JSON. [sid] is
-        the chat connection whose turn calls it, which picks the phone (see [route])."""
-        device_id, refusal = self.route(tool, sid)
+        the chat connection whose turn calls it, and [profile] the profile whose agent does; together they pick
+        the phone (see [route])."""
+        device_id, refusal = self.route(tool, sid, profile)
         if device_id is None:
             return _error(refusal or "No phone offers this tool any more.")
         timeout = TOOLS[tool][1]
@@ -449,6 +488,9 @@ class Phones:
         now = self.clock()
         request = {"id": request_id, "device_id": device_id, "tool": tool, "args": args if isinstance(args, dict) else {},
                    "session": str(session_id or ""), "created": int(now), "expires": int(now + timeout)}
+        if profile:
+            # So the phone can check it too, and a push names it.
+            request["profile"] = profile
         _write_private(self._path(request_id, "req"), request)
         # Read after writing: a remove that ran in between has either seen this request (and answers it) or
         # is seen here; either way the call doesn't wait out its timeout for a phone that's gone.
@@ -517,7 +559,10 @@ class Phones:
                 continue
             if self._path(str(request.get("id")), "res").exists():
                 continue
-            out.append({k: request.get(k) for k in ("id", "tool", "args", "session", "expires")})
+            entry = {k: request.get(k) for k in ("id", "tool", "args", "session", "expires")}
+            if request.get("profile"):
+                entry["profile"] = request["profile"]
+            out.append(entry)
         return sorted(out, key=lambda r: r["expires"])
 
     def answer(self, device_id: str, request_id: str, result: object, error: Optional[str]) -> bool:
@@ -593,6 +638,27 @@ def on_messaging_platform() -> bool:
         return False
 
 
+def turn_profile() -> str:
+    """The profile whose agent is making this tool call: the profile home the call runs in, else the profile the
+    session names; "" when neither can be told (an older Hermes). Hermes runs every profile's agent in one
+    process, so the process alone doesn't say."""
+    try:
+        from hermes_constants import get_hermes_home, profile_name_for_home
+        name = profile_name_for_home(get_hermes_home())
+        if name and PROFILE_RE.match(name):
+            return name
+    except Exception:
+        pass
+    try:
+        from gateway.session_context import get_session_env
+        name = str(get_session_env("HERMES_SESSION_PROFILE", "") or "")
+        if PROFILE_RE.match(name):
+            return name
+    except Exception:
+        pass
+    return ""
+
+
 def turn_connection() -> str:
     """The chat connection whose message started this turn (the dashboard's session id), or "" for a turn no
     one sent: a cron job, a background task, an older Hermes."""
@@ -652,11 +718,11 @@ def register_tools(ctx, phones: Phones) -> None:
                 trimmed = call_args(args)
                 if trimmed is None:
                     return _error("reason is required.")
-                return call_result(phones.call(_name, trimmed, session_id, turn_connection()))
-            return phones.call(_name, args, session_id, turn_connection())
+                return call_result(phones.call(_name, trimmed, session_id, turn_connection(), profile=turn_profile()))
+            return phones.call(_name, args, session_id, turn_connection(), profile=turn_profile())
 
         def check(_name=name) -> bool:
-            return phones.offered(_name)
+            return phones.offered(_name, turn_profile() or None)
 
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler,
                           check_fn=no_cache_check_fn(check), emoji=emoji)

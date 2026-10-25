@@ -70,7 +70,8 @@ def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
         if push_id is not None and not isinstance(push_id, str):
             return reply(ok=False, error="bad push_id")
         try:
-            kept = phones.report(device_id, key, str(data.get("name") or ""), tools, push_id)
+            # The profiles whose agents may call this phone; without them (an older app) the phone's list stays as it is.
+            kept = phones.report(device_id, key, str(data.get("name") or ""), tools, push_id, data.get("profiles"))
         except ValueError as exc:
             return reply(ok=False, error=str(exc))
         return reply(ok=True, tools=kept)
@@ -158,19 +159,23 @@ def profiles_command(store: Store, raw: str, reply: Callable[..., str]) -> str:
         return reply(ok=False, error="not JSON")
     if not isinstance(data, dict) or not isinstance(data.get("device_id"), str):
         return reply(ok=False, error="bad device_id")
-    device = store.get(data["device_id"])
-    if device is None:
+    # Any phone the plugin knows: registered for push, or only using phone tools.
+    device_id = data["device_id"]
+    if device_id not in store.known_ids():
         return reply(ok=False, error="not registered")
     if op == "get":
-        return reply(ok=True, profiles=store.allowed_profiles(device.device_id))
+        return reply(ok=True, profiles=store.allowed_profiles(device_id))
     if op == "set":
         try:
-            return reply(ok=True, profiles=store.set_allowed_profiles(device.device_id, data.get("profiles")))
+            return reply(ok=True, profiles=store.set_allowed_profiles(device_id, data.get("profiles")))
         except ValueError as exc:
             return reply(ok=False, error=str(exc))
     if op == "clear":
-        store.clear_allowed_profiles(device.device_id)
+        store.clear_allowed_profiles(device_id)
         return reply(ok=True, profiles=None)
+    device = store.get(device_id)
+    if op == "test" and device is None:
+        return reply(ok=False, error="not registered for push")
     if op == "test":
         profile = data.get("profile")
         if not isinstance(profile, str) or not PROFILE_RE.match(profile):

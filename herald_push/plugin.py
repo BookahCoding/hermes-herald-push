@@ -24,12 +24,13 @@ MAX_DETAILS_BYTES = 1200
 
 def wake_message(request: dict) -> dict:
     """The push that tells a phone about [request]: a nudge to fetch it, or for a ring the call itself."""
+    profile = request.get("profile") or None
     if request.get("tool") != CALL_TOOL:
-        return push.message("phone_request", request_id=request["id"])
+        return push.message("phone_request", request_id=request["id"], bot=profile)
     args = request.get("args") or {}
     details = args.get("details")
     return push.message(
-        "phone_call", request_id=request["id"], session=request.get("session") or None,
+        "phone_call", request_id=request["id"], session=request.get("session") or None, bot=profile,
         expires=request.get("expires"), reason=push.clip_bytes(str(args.get("reason") or ""), MAX_REASON_BYTES),
         details=push.clip_bytes(details, MAX_DETAILS_BYTES) if isinstance(details, str) else None)
 

@@ -175,7 +175,7 @@ def test_a_phone_removed_after_routing_doesnt_leave_the_call_waiting(tmp_path, m
     phones = Phones(Store(tmp_path))
     phones.report(OTHER, OTHER_KEY, "Tablet", ["phone_battery"])
     # Routed to the Tablet, then removed before the call wrote its request: nothing would answer it.
-    monkeypatch.setattr(phones, "route", lambda tool, sid="": (OTHER, None))
+    monkeypatch.setattr(phones, "route", lambda tool, sid="", profile=None: (OTHER, None))
     phones.remove(OTHER)
     started = time.time()
     assert json.loads(phones.call("phone_battery", {}))["error"] == "The user removed that phone."
