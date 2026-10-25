@@ -23,6 +23,7 @@ import hmac
 import json
 import logging
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -638,15 +639,55 @@ def on_messaging_platform() -> bool:
         return False
 
 
-def turn_profile() -> str:
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+def _multiplexing() -> bool:
+    """Whether this process serves several profiles (Hermes' multiplex mode). Unknown counts as yes."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return bool(is_multiplex_active())
+    except Exception:
+        return True
+
+
+def _profile_holding_session(session_id: str, root) -> str:
+    """The profile whose ``state.db`` holds [session_id], read-only; "" unless exactly one does. A turn belongs to
+    the profile that stores its session, whatever process runs it."""
+    if not root or not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+        return ""
+    from .watcher import profile_homes
+    found = []
+    for name, home in profile_homes(Path(root)):
+        db = Path(home) / "state.db"
+        if not db.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=2.0)
+            try:
+                if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone():
+                    found.append(name)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+    return found[0] if len(found) == 1 else ""
+
+
+def turn_profile(session_id: str = "", root=None) -> str:
     """The profile whose agent is making this tool call, or "" when that can't be told for certain.
 
-    Hermes runs several profiles' agents in one process, so the process alone doesn't say, and its home falls back
-    to the launch profile (``default``) when nothing is bound. Only what a turn binds for itself is trusted: the
-    profile home a scheduled job or a routed turn runs under, and the profile its session names. The bare process
-    home is never trusted, since it would read a profile as ``default``. Two sources that disagree, or a ``default``
-    that the process home contradicts, or none at all, give "": a phone with a list refuses it (as for any profile
-    it doesn't list) and a phone with no list takes it, as before."""
+    Hermes can run several profiles' agents in one process, and the process home falls back to the launch profile
+    (``default``) when nothing is bound, so it is trusted only where it can't be wrong. In order:
+
+    1. What a turn binds for itself: the profile home a scheduled job or a routed turn runs under, and the profile
+       its session names. Two that disagree, or a ``default`` that the process home contradicts, are unknown.
+    2. Nothing bound, in a process that serves only one profile (an ordinary default-profile cron job, say): that
+       profile, which is the process home.
+    3. Nothing bound, in a process serving several: the one profile whose ``state.db`` holds this turn's session
+       ([session_id], else the session's own), looked up under [root]; unknown unless exactly one does.
+
+    "" is refused by a phone with a list (as any profile it doesn't list is) and taken by one with none."""
     override = session = process = ""
     try:
         from hermes_constants import get_hermes_home, get_hermes_home_override, profile_name_for_home
@@ -656,20 +697,26 @@ def turn_profile() -> str:
         process = profile_name_for_home(get_hermes_home()) or ""
     except Exception:
         pass
+    env_session_id = ""
     try:
         from gateway.session_context import get_session_env
         session = str(get_session_env("HERMES_SESSION_PROFILE", "") or "")
+        env_session_id = str(get_session_env("HERMES_SESSION_ID", "") or "")
     except Exception:
         pass
     named = {name for name in (override, session) if name}
-    if len(named) != 1:
-        return ""  # nothing bound, or two sources that disagree
-    name = named.pop()
-    if not PROFILE_RE.match(name):
-        return ""
-    if name == "default" and process and process != "default":
-        return ""  # said to be the default while the process runs as another profile
-    return name
+    if len(named) > 1:
+        return ""  # two sources that disagree
+    if named:
+        name = named.pop()
+        if not PROFILE_RE.match(name):
+            return ""
+        if name == "default" and process and process != "default":
+            return ""  # said to be the default while the process itself runs as another profile
+        return name
+    if not _multiplexing():
+        return process if process and PROFILE_RE.match(process) else ""
+    return _profile_holding_session(session_id or env_session_id, root)
 
 
 def turn_connection() -> str:
@@ -713,6 +760,11 @@ _watch_lock = threading.Lock()
 _watch: Optional[_Watch] = None
 
 
+def _home_root(phones: "Phones") -> Path:
+    """The Hermes root, where every profile's home is: this plugin's data is in <root>/plugin-data/herald-push."""
+    return Path(phones.store.root).parent.parent
+
+
 def register_tools(ctx, phones: Phones) -> None:
     """Every phone tool, each offered only while a phone has it on."""
     global _watch
@@ -731,11 +783,11 @@ def register_tools(ctx, phones: Phones) -> None:
                 trimmed = call_args(args)
                 if trimmed is None:
                     return _error("reason is required.")
-                return call_result(phones.call(_name, trimmed, session_id, turn_connection(), profile=turn_profile()))
-            return phones.call(_name, args, session_id, turn_connection(), profile=turn_profile())
+                return call_result(phones.call(_name, trimmed, session_id, turn_connection(), profile=turn_profile(session_id, _home_root(phones))))
+            return phones.call(_name, args, session_id, turn_connection(), profile=turn_profile(session_id, _home_root(phones)))
 
         def check(_name=name) -> bool:
-            return phones.offered(_name, turn_profile() or None)
+            return phones.offered(_name, turn_profile("", _home_root(phones)) or None)
 
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler,
                           check_fn=no_cache_check_fn(check), emoji=emoji)

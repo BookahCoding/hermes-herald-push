@@ -171,7 +171,7 @@ def test_a_call_with_no_profile_in_the_request_pushes_no_bot_field(tmp_path):
 # ── the handler: which profile is calling ────────────────────────────────────
 
 def test_the_handler_passes_the_calling_profile_and_a_froebel_call_is_refused(tmp_path, ctx, monkeypatch):
-    monkeypatch.setattr(phone, "turn_profile", lambda: "froebel")
+    monkeypatch.setattr(phone, "turn_profile", lambda *a, **k: "froebel")
     phones = limited(tmp_path)
     phone.register_tools(ctx, phones)
     handler, check = ctx.tools["phone_battery"]
@@ -188,7 +188,7 @@ def test_the_handler_passes_the_calling_profile_and_a_froebel_call_is_refused(tm
 
 
 def test_a_call_me_from_froebel_does_not_ring_and_says_to_reach_the_user_another_way(tmp_path, ctx, monkeypatch):
-    monkeypatch.setattr(phone, "turn_profile", lambda: "froebel")
+    monkeypatch.setattr(phone, "turn_profile", lambda *a, **k: "froebel")
     phones = limited(tmp_path)
     phone.register_tools(ctx, phones)
     stop = eager_phone(phones, {"status": "answered"})
@@ -203,7 +203,7 @@ def test_a_call_me_from_froebel_does_not_ring_and_says_to_reach_the_user_another
 
 
 def test_the_default_profiles_agent_still_reaches_the_phone(tmp_path, ctx, monkeypatch):
-    monkeypatch.setattr(phone, "turn_profile", lambda: "default")
+    monkeypatch.setattr(phone, "turn_profile", lambda *a, **k: "default")
     phones = limited(tmp_path)
     phone.register_tools(ctx, phones)
     handler, check = ctx.tools["phone_battery"]
@@ -226,7 +226,7 @@ def test_the_default_profiles_agent_still_reaches_the_phone(tmp_path, ctx, monke
     thread.join()
 
 
-def fake_modules(monkeypatch, override=None, process="default", session=None, raises=False):
+def fake_modules(monkeypatch, override=None, process="default", session=None, raises=False, multiplex=None, session_id=None):
     """Stand-ins for Hermes' own modules: [override] is the profile a turn bound as its home (None: nothing bound),
     [process] the profile the process home names (it falls back to the launch profile), [session] what the session
     says. The profile is read from them the way it is on a gateway."""
@@ -242,6 +242,16 @@ def fake_modules(monkeypatch, override=None, process="default", session=None, ra
         return (session if name == "HERMES_SESSION_PROFILE" and session is not None else default)
 
     session_module.get_session_env = get_session_env
+    if session_id is not None:
+        inner = get_session_env
+        session_module.get_session_env = lambda name, default="": session_id if name == "HERMES_SESSION_ID" else inner(name, default)
+    if multiplex is not None:
+        scope = types.ModuleType("agent.secret_scope")
+        scope.is_multiplex_active = lambda: multiplex
+        monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+        monkeypatch.setitem(sys.modules, "agent.secret_scope", scope)
+    else:
+        monkeypatch.delitem(sys.modules, "agent.secret_scope", raising=False)
     monkeypatch.setitem(sys.modules, "hermes_constants", constants)
     monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
     monkeypatch.setitem(sys.modules, "gateway.session_context", session_module)
@@ -298,6 +308,106 @@ def test_an_unknown_calling_profile_is_refused_by_a_phone_with_a_list_and_taken_
     legacy = Phones(Store(tmp_path / "legacy"))
     legacy.report(MINE, KEY, "Pixel", ["phone_battery"])
     assert legacy.route("phone_battery", profile="")[0] == MINE
+
+
+def make_profiles(tmp_path, with_session=None):
+    """A root with the default profile and froebel, each with a state.db whose sessions table holds [with_session]:
+    a dict of profile name to the session ids it stores."""
+    import sqlite3
+    homes = {"default": tmp_path, "froebel": tmp_path / "profiles" / "froebel", "alice": tmp_path / "profiles" / "alice"}
+    for name, home in homes.items():
+        home.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(home / "state.db")
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
+        for sid in (with_session or {}).get(name, []):
+            conn.execute("INSERT INTO sessions (id) VALUES (?)", (sid,))
+        conn.commit()
+        conn.close()
+    return tmp_path
+
+
+def test_an_ordinary_default_job_in_a_process_that_serves_one_profile_is_the_default(monkeypatch):
+    # No override, no session profile (a cron job's is empty): the process is the profile.
+    fake_modules(monkeypatch, override=None, session="", process="default", multiplex=False)
+    assert phone.turn_profile() == "default"
+    fake_modules(monkeypatch, override=None, session="", process="froebel", multiplex=False)
+    assert phone.turn_profile() == "froebel"
+
+
+def test_nothing_bound_in_a_process_serving_several_profiles_is_found_by_its_session(tmp_path, monkeypatch):
+    root = make_profiles(tmp_path, {"froebel": ["s-froebel-1"], "default": ["s-mine-1"]})
+    fake_modules(monkeypatch, override=None, session="", process="default", multiplex=True)
+    assert phone.turn_profile("s-froebel-1", root) == "froebel"
+    assert phone.turn_profile("s-mine-1", root) == "default"
+    # Its own session id from the context, when the handler is given none.
+    fake_modules(monkeypatch, override=None, session="", process="default", multiplex=True, session_id="s-froebel-1")
+    assert phone.turn_profile("", root) == "froebel"
+
+
+def test_a_session_that_is_nowhere_or_in_two_profiles_or_not_an_id_is_unknown(tmp_path, monkeypatch):
+    root = make_profiles(tmp_path, {"froebel": ["dup", "only-froebel"], "alice": ["dup"]})
+    fake_modules(monkeypatch, override=None, session="", process="default", multiplex=True)
+    assert phone.turn_profile("nowhere", root) == ""
+    assert phone.turn_profile("dup", root) == ""
+    assert phone.turn_profile("../evil", root) == ""
+    assert phone.turn_profile("", root) == ""
+    assert phone.turn_profile("only-froebel", None) == ""
+    assert phone.turn_profile("only-froebel", root) == "froebel"
+
+
+def test_when_it_cant_be_told_whether_the_process_serves_several_profiles_it_does_not_trust_the_home(tmp_path, monkeypatch):
+    root = make_profiles(tmp_path, {"froebel": ["s-1"]})
+    fake_modules(monkeypatch, override=None, session="", process="default", multiplex=None)  # no such module
+    assert phone.turn_profile("s-1", root) == "froebel"
+    assert phone.turn_profile("unknown", root) == ""
+
+
+def test_disagreeing_sources_are_not_rescued_by_the_fallbacks(tmp_path, monkeypatch):
+    root = make_profiles(tmp_path, {"default": ["s-1"]})
+    fake_modules(monkeypatch, override="froebel", session="default", process="default", multiplex=False)
+    assert phone.turn_profile("s-1", root) == ""
+
+
+def test_the_handler_finds_a_default_jobs_profile_and_it_reaches_the_phone(tmp_path, ctx, monkeypatch):
+    """A default-profile cron job's call_me: nothing bound, one profile in the process, so it is the default."""
+    import threading
+    fake_modules(monkeypatch, override=None, session="", process="default", multiplex=False)
+    phones = limited(tmp_path)
+    phone.register_tools(ctx, phones)
+    stop = eager_phone(phones, {"status": "answered"})
+    try:
+        result = json.loads(ctx.tools[phone.CALL_TOOL][0]({"reason": "Seven thirty"}))
+    finally:
+        stop.set()
+    assert result.get("status") == "answered"
+
+
+def test_in_a_process_serving_several_profiles_the_handler_tells_them_apart_by_the_turns_session(tmp_path, ctx, monkeypatch):
+    root = make_profiles(tmp_path / "hermes", {"froebel": ["s-froebel"], "default": ["s-mine"]})
+    fake_modules(monkeypatch, override=None, session="", process="default", multiplex=True)
+    phones = Phones(Store(root / "plugin-data" / "herald-push"))
+    phones.report(MINE, KEY, "Pixel", ["phone_battery", phone.CALL_TOOL], profiles=["default"])
+    phone.register_tools(ctx, phones)
+    handler = ctx.tools["phone_battery"][0]
+    call_me = ctx.tools[phone.CALL_TOOL][0]
+    stop = eager_phone(phones, {"level": 80, "status": "answered"})
+    try:
+        # The same for a ring.
+        rings_hers = json.loads(call_me({"reason": "Hello"}, session_id="s-froebel"))
+        rings_mine = json.loads(call_me({"reason": "Hello"}, session_id="s-mine"))
+        # Her agent's call: the session is hers, so the phone is never asked.
+        hers = json.loads(handler({}, session_id="s-froebel"))
+        # Yours: the session is in your profile, so it reaches the phone.
+        mine = json.loads(handler({}, session_id="s-mine"))
+        # A session no profile holds can't be attributed, and is refused too.
+        nobody = json.loads(handler({}, session_id="s-unknown"))
+    finally:
+        stop.set()
+    assert rings_hers.get("status") != "answered"
+    assert rings_mine.get("status") == "answered"
+    assert "level" not in hers and "error" in hers
+    assert mine["level"] == 80
+    assert "level" not in nobody and "error" in nobody
 
 
 # ── the list for a phone that only uses phone tools ──────────────────────────

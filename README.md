@@ -56,12 +56,14 @@ that isn't on it, whether the plugin has never seen it or it was made after the 
   (`profiles` in the JSON), else the list of the push registration it is linked to, else none (every profile). A
   profile that can't be told counts as not on a list. The request and the push for it name the profile (`bot`), so
   the phone can check it too.
-- **Which profile is calling.** Hermes runs several profiles' agents in one process, and the process home falls
-  back to the launch profile, which reads as `default`. So only what a turn binds for itself is trusted: the profile
-  home a scheduled job runs under, and the profile its session names. Two sources that disagree, a `default` that
-  the process contradicts, or none at all, count as unknown, which a phone with a list refuses. Each profile loads
-  its own copy of this plugin, so a profile whose copy is older than 0.6.0 has phone tools that don't check any
-  of this: update that copy too.
+- **Which profile is calling.** Hermes can run several profiles' agents in one process, and the process home falls
+  back to the launch profile, which reads as `default`. So the profile is taken, in order, from what the turn binds
+  for itself (the profile home a scheduled job or a routed turn runs under, and the profile its session names; two
+  that disagree, or a `default` the process contradicts, are unknown); else, in a process that serves only one
+  profile, that profile (an ordinary default-profile cron job); else, in a process serving several, the one profile
+  whose `state.db` holds the turn's session. Anything else is unknown, which a phone with a list refuses. Each
+  profile loads its own copy of this plugin, so a profile whose copy is older than 0.6.0 has phone tools that
+  don't check any of this: update that copy too.
 - **Who may change a phone's list.** A phone that uses phone tools has a secret key, and `profiles set` and
   `profiles clear` for it need that key; reading a list does not.
 - **Every copy must be 0.6.0.** A profile with its own older copy of this plugin does not know about the lists.
