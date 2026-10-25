@@ -639,24 +639,37 @@ def on_messaging_platform() -> bool:
 
 
 def turn_profile() -> str:
-    """The profile whose agent is making this tool call: the profile home the call runs in, else the profile the
-    session names; "" when neither can be told (an older Hermes). Hermes runs every profile's agent in one
-    process, so the process alone doesn't say."""
+    """The profile whose agent is making this tool call, or "" when that can't be told for certain.
+
+    Hermes runs several profiles' agents in one process, so the process alone doesn't say, and its home falls back
+    to the launch profile (``default``) when nothing is bound. Only what a turn binds for itself is trusted: the
+    profile home a scheduled job or a routed turn runs under, and the profile its session names. The bare process
+    home is never trusted, since it would read a profile as ``default``. Two sources that disagree, or a ``default``
+    that the process home contradicts, or none at all, give "": a phone with a list refuses it (as for any profile
+    it doesn't list) and a phone with no list takes it, as before."""
+    override = session = process = ""
     try:
-        from hermes_constants import get_hermes_home, profile_name_for_home
-        name = profile_name_for_home(get_hermes_home())
-        if name and PROFILE_RE.match(name):
-            return name
+        from hermes_constants import get_hermes_home, get_hermes_home_override, profile_name_for_home
+        bound = get_hermes_home_override()
+        if bound:
+            override = profile_name_for_home(bound) or ""
+        process = profile_name_for_home(get_hermes_home()) or ""
     except Exception:
         pass
     try:
         from gateway.session_context import get_session_env
-        name = str(get_session_env("HERMES_SESSION_PROFILE", "") or "")
-        if PROFILE_RE.match(name):
-            return name
+        session = str(get_session_env("HERMES_SESSION_PROFILE", "") or "")
     except Exception:
         pass
-    return ""
+    named = {name for name in (override, session) if name}
+    if len(named) != 1:
+        return ""  # nothing bound, or two sources that disagree
+    name = named.pop()
+    if not PROFILE_RE.match(name):
+        return ""
+    if name == "default" and process and process != "default":
+        return ""  # said to be the default while the process runs as another profile
+    return name
 
 
 def turn_connection() -> str:

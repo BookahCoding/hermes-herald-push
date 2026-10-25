@@ -79,7 +79,7 @@ def test_a_phone_with_a_list_takes_calls_only_from_its_profiles(tmp_path):
     phones = limited(tmp_path)
     assert phones.route("phone_battery", profile="default") == (MINE, None)
     device, refusal = phones.route("phone_battery", profile="froebel")
-    assert device is None and "doesn't" in refusal or "No phone takes calls" in refusal
+    assert device is None and ("doesn't" in refusal or "No phone takes calls" in refusal)
     # A profile made later, and one that can't be told, are not on the list either.
     assert phones.route("phone_battery", profile="made-later")[0] is None
     assert phones.route("phone_battery", profile="")[0] is None
@@ -226,39 +226,78 @@ def test_the_default_profiles_agent_still_reaches_the_phone(tmp_path, ctx, monke
     thread.join()
 
 
-def fake_modules(monkeypatch, home=None, home_name=None, env=None, raises=False):
-    """Stand-ins for Hermes' own modules, so the profile is read the way it is on a gateway."""
+def fake_modules(monkeypatch, override=None, process="default", session=None, raises=False):
+    """Stand-ins for Hermes' own modules: [override] is the profile a turn bound as its home (None: nothing bound),
+    [process] the profile the process home names (it falls back to the launch profile), [session] what the session
+    says. The profile is read from them the way it is on a gateway."""
     constants = types.ModuleType("hermes_constants")
-    constants.get_hermes_home = lambda: home
-    constants.profile_name_for_home = lambda path: home_name
-    session = types.ModuleType("gateway.session_context")
+    constants.get_hermes_home_override = lambda: ("/profiles/" + override) if override else None
+    constants.get_hermes_home = lambda: "/profiles/" + (process or "")
+    constants.profile_name_for_home = lambda path: str(path).split("/profiles/", 1)[-1] or None
+    session_module = types.ModuleType("gateway.session_context")
 
     def get_session_env(name, default=""):
         if raises:
             raise RuntimeError("no context")
-        return (env or {}).get(name, default)
+        return (session if name == "HERMES_SESSION_PROFILE" and session is not None else default)
 
-    session.get_session_env = get_session_env
+    session_module.get_session_env = get_session_env
     monkeypatch.setitem(sys.modules, "hermes_constants", constants)
     monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
-    monkeypatch.setitem(sys.modules, "gateway.session_context", session)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session_module)
 
 
-def test_the_profile_is_read_from_the_home_the_call_runs_in(monkeypatch):
-    fake_modules(monkeypatch, home="/h/profiles/froebel", home_name="froebel", env={"HERMES_SESSION_PROFILE": "default"})
-    assert phone.turn_profile() == "froebel"  # the home is authoritative over the session's own word
+def test_a_scheduled_jobs_profile_is_the_home_it_runs_under(monkeypatch):
+    fake_modules(monkeypatch, override="froebel", session="", process="default")
+    assert phone.turn_profile() == "froebel"
 
 
-def test_the_profile_falls_back_to_the_session_and_then_to_unknown(monkeypatch):
-    fake_modules(monkeypatch, home=None, home_name=None, env={"HERMES_SESSION_PROFILE": "alice"})
+def test_a_dashboard_turns_profile_is_what_its_session_names(monkeypatch):
+    fake_modules(monkeypatch, override=None, session="froebel", process="default")
+    assert phone.turn_profile() == "froebel"
+    fake_modules(monkeypatch, override=None, session="default", process="default")
+    assert phone.turn_profile() == "default"
+    fake_modules(monkeypatch, override="alice", session="alice", process="default")
     assert phone.turn_profile() == "alice"
-    fake_modules(monkeypatch, home=None, home_name=None, env={})
+
+
+def test_sources_that_disagree_are_not_guessed_at(monkeypatch):
+    # A routed home against a session that says the launch profile: the one that could pass for the default loses.
+    fake_modules(monkeypatch, override="froebel", session="default", process="default")
     assert phone.turn_profile() == ""
-    fake_modules(monkeypatch, home=None, home_name=None, raises=True)
+    fake_modules(monkeypatch, override="default", session="froebel", process="default")
     assert phone.turn_profile() == ""
-    # A name that isn't a profile name is not trusted.
-    fake_modules(monkeypatch, home="x", home_name="../evil", env={"HERMES_SESSION_PROFILE": "bad name"})
+    # Said to be the default while the process itself runs as another profile.
+    fake_modules(monkeypatch, override=None, session="default", process="froebel")
     assert phone.turn_profile() == ""
+
+
+def test_the_bare_process_home_is_never_trusted_on_its_own(monkeypatch):
+    # Nothing bound: it would read every profile as the launch profile, "default".
+    fake_modules(monkeypatch, override=None, session="", process="default")
+    assert phone.turn_profile() == ""
+    fake_modules(monkeypatch, override=None, session=None, process="froebel")
+    assert phone.turn_profile() == ""
+
+
+def test_whatever_cant_be_read_or_isnt_a_profile_name_is_unknown(monkeypatch):
+    fake_modules(monkeypatch, override=None, session="x", process="default", raises=True)
+    assert phone.turn_profile() == ""
+    fake_modules(monkeypatch, override=None, session="bad name", process="default")
+    assert phone.turn_profile() == ""
+    fake_modules(monkeypatch, override="../evil", session="", process="default")
+    assert phone.turn_profile() == ""
+    monkeypatch.delitem(sys.modules, "hermes_constants")
+    monkeypatch.delitem(sys.modules, "gateway.session_context")
+    assert phone.turn_profile() == ""
+
+
+def test_an_unknown_calling_profile_is_refused_by_a_phone_with_a_list_and_taken_by_one_without(tmp_path):
+    phones = limited(tmp_path)
+    assert phones.route("phone_battery", profile="")[0] is None
+    legacy = Phones(Store(tmp_path / "legacy"))
+    legacy.report(MINE, KEY, "Pixel", ["phone_battery"])
+    assert legacy.route("phone_battery", profile="")[0] == MINE
 
 
 # ── the list for a phone that only uses phone tools ──────────────────────────
@@ -315,11 +354,37 @@ def test_the_commands_set_and_read_a_phone_tool_phones_list(tmp_path):
     body = {"device_id": MINE, "key": KEY, "name": "Pixel", "tools": ["phone_battery"], "profiles": ["default"]}
     assert json.loads(handle("phone tools " + json.dumps(body)))["ok"] is True
     assert json.loads(handle("profiles get " + json.dumps({"device_id": MINE})))["profiles"] == ["default"]
-    assert json.loads(handle("profiles set " + json.dumps({"device_id": MINE, "profiles": ["default", "alice"]})))["profiles"] == ["alice", "default"]
+    ask = {"device_id": MINE, "key": KEY, "profiles": ["default", "alice"]}
+    assert json.loads(handle("profiles set " + json.dumps(ask)))["profiles"] == ["alice", "default"]
     # Not a push phone: a synthetic push has nowhere to go.
     assert json.loads(handle("profiles test " + json.dumps({"device_id": MINE, "profile": "default"})))["ok"] is False
     bad = json.loads(handle("phone tools " + json.dumps({**body, "profiles": "default"})))
     assert bad["ok"] is False
+
+
+def test_only_the_phones_own_key_can_change_who_may_call_it(tmp_path):
+    store = Store(tmp_path)
+    phones = Phones(store)
+    handle = commands.make_handler(store, "t", lambda: True, trusted=lambda: True, phones=phones)
+    handle("phone tools " + json.dumps({"device_id": MINE, "key": KEY, "name": "Pixel", "tools": ["phone_battery"], "profiles": ["default"]}))
+    widen = {"device_id": MINE, "profiles": ["default", "froebel"]}
+    # Any signed-in dashboard session can name the phone's id; without its key, nothing changes.
+    for extra in ({}, {"key": SPARE_KEY}, {"key": 5}):
+        assert json.loads(handle("profiles set " + json.dumps({**widen, **extra})))["error"] == "bad key"
+        assert json.loads(handle("profiles clear " + json.dumps({"device_id": MINE, **extra})))["error"] == "bad key"
+    assert store.allowed_profiles(MINE) == ["default"]
+    assert phones.route("phone_battery", profile="froebel")[0] is None
+    assert json.loads(handle("profiles set " + json.dumps({**widen, "key": KEY})))["ok"] is True
+    assert phones.route("phone_battery", profile="froebel")[0] == MINE
+    # Reading it needs no key: it names no secret.
+    assert json.loads(handle("profiles get " + json.dumps({"device_id": MINE})))["profiles"] == ["default", "froebel"]
+
+
+def test_a_push_phones_list_is_still_set_by_the_app_without_a_key(tmp_path):
+    store = Store(tmp_path)
+    store.upsert(push_phone(SPARE))
+    handle = commands.make_handler(store, "t", lambda: True, trusted=lambda: True, phones=Phones(store))
+    assert json.loads(handle("profiles set " + json.dumps({"device_id": SPARE, "profiles": ["default"]})))["ok"] is True
 
 
 def test_the_version_in_the_manifest_still_matches(tmp_path):

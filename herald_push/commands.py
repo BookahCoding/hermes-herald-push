@@ -146,7 +146,7 @@ def cron_command(store: Store, raw: str, reply: Callable[..., str], root: Option
     return reply(ok=True, jobs=current.jobs, failures=current.failures, default=current.default)
 
 
-def profiles_command(store: Store, raw: str, reply: Callable[..., str]) -> str:
+def profiles_command(store: Store, raw: str, reply: Callable[..., str], phones: Optional[Phones] = None) -> str:
     """``profiles get|set|clear|test <json>``: which profiles a registered phone may be sent. ``get`` reads the
     phone's list (``profiles`` is null when it has none and is sent everything); ``set`` replaces it with
     ``profiles``, a list of names, so a profile not on it (unknown, or made later) is not sent; ``clear`` goes back
@@ -163,6 +163,12 @@ def profiles_command(store: Store, raw: str, reply: Callable[..., str]) -> str:
     device_id = data["device_id"]
     if device_id not in store.known_ids():
         return reply(ok=False, error="not registered")
+    # A phone that uses phone tools has a secret key, and only it may change what that phone takes calls from:
+    # a profile added to the list lets that profile's agent ring and read the phone.
+    if op in ("set", "clear") and phones is not None and device_id in phones._phones():
+        key = data.get("key")
+        if not isinstance(key, str) or not phones.verify(device_id, key):
+            return reply(ok=False, error="bad key")
     if op == "get":
         return reply(ok=True, profiles=store.allowed_profiles(device_id))
     if op == "set":
@@ -213,7 +219,7 @@ def make_handler(store: Store, version: str, watching: Callable[[], bool],
             if op == "cron":
                 return cron_command(store, rest, reply, root)
             if op == "profiles":
-                return profiles_command(store, rest, reply)
+                return profiles_command(store, rest, reply, phones)
             if op == "register":
                 try:
                     data = json.loads(rest)
