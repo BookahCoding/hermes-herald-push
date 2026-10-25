@@ -32,6 +32,25 @@ hermes plugins install https://github.com/Giton22/hermes-herald-push
 
 **Not yet:** replying or approving through push. Those still use the direct connection.
 
+## Which profiles a phone hears from (0.6.0)
+
+Every phone can have a list of the profiles it may be sent. A phone **with a list** gets exactly those: a profile
+that isn't on it, whether the plugin has never seen it or it was made after the list was, is not sent. A phone
+**without a list** is sent every profile, as before.
+
+- **Where it applies.** Before a Bot Chat reply is pushed; before a cron run is pushed, ahead of the `failures`
+  and `default` follow rules, so neither brings back a profile the phone isn't allowed; and in `cron inbox` and
+  `cron read`. Phone-tool requests and calls are not filtered by profile.
+- **Registering.** The list travels with the registration (`profiles` in the `register` JSON) and is stored first,
+  so a renewed phone is limited from its first push. A registration without `profiles` leaves an existing list as
+  it is. `unregister` forgets the list. The lists are in `profiles.json` (0600), read on every poll, so a change
+  applies at once and a restart keeps it.
+- **Commands.** `/herald-push profiles get|set|clear|test <json>` with the phone's `device_id`: `set` takes
+  `profiles` (a list of names), `test` takes a `profile` and sends one synthetic message through the same check as
+  a real push. `info` and `register` answer with `features: ["profile_allowlist"]`, which Herald checks for.
+- **If the lists can't be read** the plugin falls back to `default` only for every phone, never to everything.
+- **Every copy must be 0.6.0.** A profile with its own older copy of this plugin does not know about the lists.
+
 ## Cron runs (0.4.0)
 
 Finished cron runs for Herald's Inbox, for the jobs a phone follows.

@@ -25,6 +25,11 @@ TOPIC_RE = re.compile(r"^hp-[0-9a-f]{32}$")
 DEVICE_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 SERVER_RE = re.compile(r"^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 MAX_DEVICES = 20
+# A profile's name, as Hermes allows it (also the cron module's PROFILE_RE).
+PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+MAX_PROFILES = 200
+# What a phone's list falls back to when the file that holds the lists can't be read: fail closed, never open.
+SAFE_PROFILES = ("default",)
 MAX_NAME = 64
 _REPLACE_TRIES = 6
 
@@ -139,6 +144,40 @@ def _exclusive(root: Path):
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
+def clean_profiles(profiles: object) -> List[str]:
+    """A phone's allowed profiles, checked: a list of well-formed names, without repeats. Anything else is refused,
+    never trimmed to something that looks valid."""
+    if not isinstance(profiles, list) or len(profiles) > MAX_PROFILES:
+        raise ValueError("profiles must be a list of at most %d names" % MAX_PROFILES)
+    seen: List[str] = []
+    for name in profiles:
+        if not isinstance(name, str) or not PROFILE_RE.match(name):
+            raise ValueError("bad profile name")
+        if name not in seen:
+            seen.append(name)
+    return sorted(seen)
+
+
+class Allowlist:
+    """One look at which profiles each phone may be sent. A phone with a list gets exactly its profiles: one that
+    isn't on it, whether unknown or made after the list was, is not sent. A phone with no list is sent everything,
+    as before profiles could be limited. If the lists can't be read, every phone gets [SAFE_PROFILES] only."""
+
+    def __init__(self, lists: Dict[str, List[str]], unreadable: bool = False):
+        self._lists = lists
+        self.unreadable = unreadable
+
+    def get(self, device_id: str) -> Optional[List[str]]:
+        """The phone's list; None when it has none (or, unreadable, the safe one)."""
+        if self.unreadable:
+            return list(SAFE_PROFILES)
+        return self._lists.get(device_id)
+
+    def allows(self, device_id: str, profile: str) -> bool:
+        allowed = self.get(device_id)
+        return True if allowed is None else profile in allowed
+
+
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -183,7 +222,14 @@ class Store:
                 continue
         return out
 
-    def upsert(self, device: Device) -> None:
+    def upsert(self, device: Device, profiles: Optional[List[str]] = None) -> None:
+        """Registers [device]. With [profiles] its list is stored too, before the phone is listed: a reader that
+        sees the phone then sees its list, so a renewed phone is never sent a push the list would have stopped.
+        Without them, a list the phone already has is left as it is."""
+        try:
+            cleaned = None if profiles is None else clean_profiles(profiles)
+        except ValueError as exc:
+            raise InvalidRegistration(str(exc)) from exc
         with self._lock():
             kept = [d for d in self.devices() if d.device_id != device.device_id]
             # A topic belongs to one phone: a second registration can't take over another phone's topics.
@@ -192,6 +238,8 @@ class Store:
                 raise InvalidRegistration("topic already registered by another phone")
             if len(kept) >= MAX_DEVICES:
                 raise InvalidRegistration("too many phones registered")
+            if cleaned is not None:
+                self._write_profiles({d.device_id for d in kept + [device]}, device.device_id, cleaned)
             _write_private(self.root / "devices.json", {"devices": [asdict(d) for d in kept + [device]]})
 
     def remove(self, device_id: str) -> bool:
@@ -200,11 +248,66 @@ class Store:
             kept = [d for d in devices if d.device_id != device_id]
             if len(kept) == len(devices):
                 return False
+            # The list goes first, then the phone: no list is left behind for an id that comes back.
+            self._write_profiles({d.device_id for d in kept}, None, None)
             _write_private(self.root / "devices.json", {"devices": [asdict(d) for d in kept]})
             return True
 
     def get(self, device_id: str) -> Optional[Device]:
         return next((d for d in self.devices() if d.device_id == device_id), None)
+
+    # ── allowed profiles ────────────────────────────────────────────────────
+
+    @property
+    def _profiles_path(self) -> Path:
+        return self.root / "profiles.json"
+
+    def allowlist(self) -> Allowlist:
+        """The lists as they are now. A sender reads the devices first and this after, so a phone it sees has its list."""
+        path = self._profiles_path
+        if not path.exists():
+            return Allowlist({})
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("not an object")
+            return Allowlist({str(k): clean_profiles(v) for k, v in raw.items()})
+        except (OSError, ValueError):
+            return Allowlist({}, unreadable=True)
+
+    def _write_profiles(self, registered: set, device_id: Optional[str], profiles: Optional[List[str]]) -> None:
+        """Rewrites the lists (the caller holds the lock): those of phones still registered, [device_id]'s set to
+        [profiles] when given. A file that can't be read is replaced only by a list being set."""
+        current = self.allowlist()
+        lists = {} if current.unreadable else {k: v for k, v in current._lists.items() if k in registered}
+        if current.unreadable and profiles is None:
+            return
+        if device_id is not None and profiles is not None:
+            lists[device_id] = profiles
+        if lists or self._profiles_path.exists():
+            _write_private(self._profiles_path, lists)
+
+    def allowed_profiles(self, device_id: str) -> Optional[List[str]]:
+        return self.allowlist().get(device_id)
+
+    def set_allowed_profiles(self, device_id: str, profiles: object) -> List[str]:
+        """Sets what a registered phone may be sent. ValueError for a bad list or an unknown phone."""
+        cleaned = clean_profiles(profiles)
+        with self._lock():
+            registered = {d.device_id for d in self.devices()}
+            if device_id not in registered:
+                raise ValueError("not registered")
+            self._write_profiles(registered, device_id, cleaned)
+        return cleaned
+
+    def clear_allowed_profiles(self, device_id: str) -> None:
+        """Back to no list: the phone is sent every profile, as before lists existed."""
+        with self._lock():
+            current = self.allowlist()
+            if current.unreadable:
+                return
+            lists = {k: v for k, v in current._lists.items() if k != device_id}
+            _write_private(self._profiles_path, lists)
 
     # ── watcher state ───────────────────────────────────────────────────────
 

@@ -15,8 +15,11 @@ from typing import Callable, Optional
 
 from . import cron, push
 from .phone import TOOLS, Phones
-from .store import InvalidRegistration, Device, Store
+from .store import PROFILE_RE, InvalidRegistration, Device, Store
 from .watcher import profile_homes
+
+# What this plugin can do that Herald checks for by name, not by version number.
+FEATURES = ["profile_allowlist"]
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +28,8 @@ MAX_ARG = 8192
 MAX_ANSWER_ARG = 64000
 USAGE = ("usage: /herald-push info | register <json> | unregister <device_id> | test <device_id> | "
          "phone tools <json> | phone pending <json> | phone answer <json> | phone here <json> | "
-         "phone list <json> | phone order <json> | phone remove <json> | cron follow|following|inbox|read <json>")
+         "phone list <json> | phone order <json> | phone remove <json> | cron follow|following|inbox|read <json> | "
+         "profiles get|set|clear|test <json>")
 
 
 def trusted_surface() -> bool:
@@ -115,7 +119,10 @@ def cron_command(store: Store, raw: str, reply: Callable[..., str], root: Option
         return reply(ok=False, error="bad device_id")
     follows = cron.Follows(store)
     device_id = data["device_id"]
-    homes = list(profile_homes(root if root is not None else store.root.parent.parent))
+    # The runs a phone is shown are only those of the profiles it may hear from, as for its pushes.
+    allow = store.allowlist()
+    homes = [(name, home) for name, home in profile_homes(root if root is not None else store.root.parent.parent)
+             if allow.allows(device_id, name)]
     if op == "inbox":
         limit, before = data.get("limit", 50), data.get("before", 0)
         if not isinstance(limit, int) or not isinstance(before, (int, float)):
@@ -138,6 +145,45 @@ def cron_command(store: Store, raw: str, reply: Callable[..., str], root: Option
     return reply(ok=True, jobs=current.jobs, failures=current.failures, default=current.default)
 
 
+def profiles_command(store: Store, raw: str, reply: Callable[..., str]) -> str:
+    """``profiles get|set|clear|test <json>``: which profiles a registered phone may be sent. ``get`` reads the
+    phone's list (``profiles`` is null when it has none and is sent everything); ``set`` replaces it with
+    ``profiles``, a list of names, so a profile not on it (unknown, or made later) is not sent; ``clear`` goes back
+    to no list; ``test`` sends the phone one synthetic Bot Chat message for ``profile`` through the same check
+    as the real ones, and answers whether it was ``allowed`` and ``sent``."""
+    op, _, rest = raw.partition(" ")
+    try:
+        data = json.loads(rest.strip())
+    except ValueError:
+        return reply(ok=False, error="not JSON")
+    if not isinstance(data, dict) or not isinstance(data.get("device_id"), str):
+        return reply(ok=False, error="bad device_id")
+    device = store.get(data["device_id"])
+    if device is None:
+        return reply(ok=False, error="not registered")
+    if op == "get":
+        return reply(ok=True, profiles=store.allowed_profiles(device.device_id))
+    if op == "set":
+        try:
+            return reply(ok=True, profiles=store.set_allowed_profiles(device.device_id, data.get("profiles")))
+        except ValueError as exc:
+            return reply(ok=False, error=str(exc))
+    if op == "clear":
+        store.clear_allowed_profiles(device.device_id)
+        return reply(ok=True, profiles=None)
+    if op == "test":
+        profile = data.get("profile")
+        if not isinstance(profile, str) or not PROFILE_RE.match(profile):
+            return reply(ok=False, error="bad profile")
+        if not store.allowlist().allows(device.device_id, profile):
+            return reply(ok=True, allowed=False, sent=False)
+        _, _, sig = store.identity()
+        payload = push.message("bot_message", bot=profile, label=profile, session="herald-profile-test",
+                               text=f"Synthetic test message for the {profile} profile. Nothing to do.")
+        return reply(ok=True, allowed=True, sent=push.publish(device, payload, sig))
+    return reply(ok=False, error=USAGE)
+
+
 def make_handler(store: Store, version: str, watching: Callable[[], bool],
                  trusted: Callable[[], bool] = trusted_surface,
                  phones: Optional[Phones] = None, root: Optional[Path] = None) -> Callable[[str], str]:
@@ -156,19 +202,26 @@ def make_handler(store: Store, version: str, watching: Callable[[], bool],
             rest = rest.strip()
             if op in ("", "info"):
                 return reply(ok=True, version=version, gateway=store.public_identity(), watching=watching(),
-                             devices=len(store.devices()), phone_tools=sorted(TOOLS))
+                             devices=len(store.devices()), phone_tools=sorted(TOOLS), features=FEATURES)
             if op == "phone" and phones is not None:
                 return phone_command(phones, rest, reply)
             if op == "cron":
                 return cron_command(store, rest, reply, root)
+            if op == "profiles":
+                return profiles_command(store, rest, reply)
             if op == "register":
                 try:
-                    device = Device.parse(json.loads(rest))
-                    store.upsert(device)
+                    data = json.loads(rest)
+                    device = Device.parse(data)
+                    # The phone's allowed profiles travel with the registration, so a renewed phone is limited
+                    # from its first push. Without them (an older app), a list it already has stays as it is.
+                    profiles = data.get("profiles") if isinstance(data, dict) else None
+                    store.upsert(device, profiles)
                 except ValueError as exc:  # InvalidRegistration and JSON errors
                     return reply(ok=False, error=str(exc) if isinstance(exc, InvalidRegistration) else "not JSON")
                 log.info("herald-push: registered %s", device.name)
-                return reply(ok=True, version=version, gateway=store.public_identity(), watching=watching())
+                return reply(ok=True, version=version, gateway=store.public_identity(), watching=watching(),
+                             features=FEATURES, profiles=store.allowed_profiles(device.device_id))
             if op == "unregister":
                 return reply(ok=store.remove(rest))
             if op == "test":

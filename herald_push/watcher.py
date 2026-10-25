@@ -20,7 +20,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import httpx
 
 from . import cron, push
-from .store import Store
+from .store import Allowlist, Store
 
 log = logging.getLogger(__name__)
 
@@ -271,8 +271,10 @@ class Watcher:
 
     def poll(self, client: Optional[httpx.Client] = None) -> int:
         """One pass over every bot and every cron job; returns how many pushes went out."""
+        # Devices first, then the lists: a phone seen here has its list (the store writes them in that order).
         devices = self.store.devices()
-        sent = self.poll_cron(devices, client)
+        allow = self.store.allowlist()
+        sent = self.poll_cron(devices, client, allow)
         changed = False
         for profile, home in profile_homes(self.root):
             try:
@@ -314,6 +316,9 @@ class Watcher:
                     del pushed[next(iter(pushed))]
                 payload = push.message("bot_message", bot=profile, label=label, session=tip, text=push.clip(text))
                 for device in devices:
+                    # Only to phones that may hear from this profile; the mark moves on either way.
+                    if not allow.allows(device.device_id, profile):
+                        continue
                     if push.publish(device, payload, sig, client):
                         sent += 1
         if changed:
@@ -327,8 +332,12 @@ class Watcher:
             self._marks_saved_at = self.now()
         return sent
 
-    def poll_cron(self, devices, client: Optional[httpx.Client] = None) -> int:
-        """Finished cron runs, to each phone that follows the job (or every failure, when it asked)."""
+    def poll_cron(self, devices, client: Optional[httpx.Client] = None, allow: Optional[Allowlist] = None) -> int:
+        """Finished cron runs, to each phone that follows the job (or every failure, when it asked), and may hear
+        from the run's profile: that is checked first, so neither failures nor a default of following every job
+        reaches a phone for a profile it isn't allowed."""
+        if allow is None:
+            allow = self.store.allowlist()
         if not self._cron_marks_loaded:
             self._cron_marks = self.store.cron_marks()
             self._cron_marks_loaded = True
@@ -342,6 +351,8 @@ class Watcher:
         sent = 0
         for run in runs:
             for device in devices:
+                if not allow.allows(device.device_id, run.profile):
+                    continue
                 notify = follows.get(device.device_id, cron.Follow({})).wants(run.job_id, run.status)
                 if notify is None:
                     continue
